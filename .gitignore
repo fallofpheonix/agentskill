@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+backend/agentman/.venv/
+backend/agentman/build/
+backend/agentman/dist/
+backend/agentman/src/*.egg-info/
+.venv-ci/
+
+docs/awesome-opencode/node_modules/
+frontend/open-antigravity/mitmserver/node_modules/

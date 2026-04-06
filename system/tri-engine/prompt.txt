@@ -1,0 +1,14 @@
+Integrate this repository into a deterministic tri-engine CI/CD workspace without creating a new product.
+
+Existing modules:
+- docs/awesome-opencode: Node-based registry generator for curated Opencode metadata
+- backend/agentman: Python Agentfile parser, builder, and container generation CLI
+- frontend/open-antigravity: product/design specification plus a local MITM proxy proof-of-concept
+- infra/codex-develop: Bash orchestration scripts for external NUM-CODEX repositories
+
+Mandatory constraints:
+- Preserve working components unless they violate determinism or security constraints
+- Expose every conflict explicitly before or during refactor
+- Remove inline credential placeholders and tracked machine artifacts
+- Provide one root CI/CD pipeline for build, test, security scan, and deploy
+- End only with modified files list, migration map, remaining risks, and modification hooks
