@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+
+# Distribution / packaging
+eggs/
+.eggs/
+*.egg-info/
+*.egg
+dist/
+
+# Testing
+htmlcov/
+.coverage
+
+# Generated files
+agent/
