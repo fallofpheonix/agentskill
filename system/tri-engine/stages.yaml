@@ -1,58 +1,206 @@
 version: 1
+roles:
+  orchestrator: antigravity
+  executor: codex
+  validator: opencode
 stages:
   - name: analyze_repository
-    agent: antigravity
-    description: Inventory the tracked codebase and classify every remaining component.
-    inputs:
-      - external:repository
-    outputs:
-      - repo_inventory
-      - conflict_report
-      - deletion_plan
-    checks:
-      - classification_complete
-      - dependency_paths_resolved
+    description: Inventory the tracked repository and classify all remaining components.
+    executor:
+      task_id: T_00001_analyze_repository_exec
+      agent: codex
+      instruction: Build the repository inventory, conflict report, and deletion plan from the tracked tree only.
+      timeout_seconds: 3600
+      max_retries: 1
+      inputs:
+        - artifact_key: external:repository
+          schema_ref: artifact_schema.json#/definitions/Repository
+          source: external
+          required: true
+      outputs:
+        - artifact_key: repo_inventory
+          schema_ref: artifact_schema.json#/definitions/RepoInventory
+          required: true
+        - artifact_key: conflict_report
+          schema_ref: artifact_schema.json#/definitions/ConflictReport
+          required: true
+        - artifact_key: deletion_plan
+          schema_ref: artifact_schema.json#/definitions/DeletionPlan
+          required: true
+    validator:
+      task_id: T_00002_analyze_repository_val
+      agent: opencode
+      inputs:
+        - artifact_key: repo_inventory
+          schema_ref: artifact_schema.json#/definitions/RepoInventory
+          source: stage_output
+          required: true
+        - artifact_key: conflict_report
+          schema_ref: artifact_schema.json#/definitions/ConflictReport
+          source: stage_output
+          required: true
+        - artifact_key: deletion_plan
+          schema_ref: artifact_schema.json#/definitions/DeletionPlan
+          source: stage_output
+          required: true
+      checks:
+        - check_id: C_00001_classification_complete
+          check_name: classification_complete
+          artifact_key: repo_inventory
+          rule: repo_inventory_components_classified
+          timeout_seconds: 300
+          failure_mode: reject_task
+        - check_id: C_00002_dependency_paths_resolved
+          check_name: dependency_paths_resolved
+          artifact_key: conflict_report
+          rule: conflict_report_dependencies_resolved
+          timeout_seconds: 300
+          failure_mode: reject_task
+        - check_id: C_00003_deletion_plan_structured
+          check_name: deletion_plan_structured
+          artifact_key: deletion_plan
+          rule: deletion_plan_structured
+          timeout_seconds: 300
+          failure_mode: reject_task
 
   - name: repair_core
-    agent: codex
-    description: Apply structural code and configuration changes against the validated inventory.
+    description: Apply contract-preserving code changes against the validated repository inventory.
     depends_on:
       - analyze_repository
-    inputs:
-      - repo_inventory
-      - conflict_report
-      - deletion_plan
-    outputs:
-      - patched_codebase
-      - enforced_contract
-    checks:
-      - no_dead_paths
-      - imports_resolved
-      - runtime_surface_minimized
+    executor:
+      task_id: T_00003_repair_core_exec
+      agent: codex
+      instruction: Produce the patched codebase summary and the enforced contract directly from validated inputs.
+      timeout_seconds: 5400
+      max_retries: 1
+      inputs:
+        - artifact_key: repo_inventory
+          schema_ref: artifact_schema.json#/definitions/RepoInventory
+          source: stage_output
+          required: true
+        - artifact_key: conflict_report
+          schema_ref: artifact_schema.json#/definitions/ConflictReport
+          source: stage_output
+          required: true
+        - artifact_key: deletion_plan
+          schema_ref: artifact_schema.json#/definitions/DeletionPlan
+          source: stage_output
+          required: true
+      outputs:
+        - artifact_key: patched_codebase
+          schema_ref: artifact_schema.json#/definitions/PatchedCodebase
+          required: true
+        - artifact_key: enforced_contract
+          schema_ref: artifact_schema.json#/definitions/EnforcedContract
+          required: true
+    validator:
+      task_id: T_00004_repair_core_val
+      agent: opencode
+      inputs:
+        - artifact_key: patched_codebase
+          schema_ref: artifact_schema.json#/definitions/PatchedCodebase
+          source: stage_output
+          required: true
+        - artifact_key: enforced_contract
+          schema_ref: artifact_schema.json#/definitions/EnforcedContract
+          source: stage_output
+          required: true
+      checks:
+        - check_id: C_00004_no_dead_paths
+          check_name: no_dead_paths
+          artifact_key: patched_codebase
+          rule: patched_codebase_has_modifications
+          timeout_seconds: 300
+          failure_mode: reject_task
+        - check_id: C_00005_runtime_surface_minimized
+          check_name: runtime_surface_minimized
+          artifact_key: enforced_contract
+          rule: enforced_contract_has_dag
+          timeout_seconds: 300
+          failure_mode: reject_task
 
   - name: validate_system
-    agent: opencode
-    description: Execute tests, build checks, and security gates against the patched tree.
+    description: Run tests, build verification, and security gates against the patched tree.
     depends_on:
       - repair_core
-    inputs:
-      - patched_codebase
-      - enforced_contract
-    outputs:
-      - validation_report
-    checks:
-      - tests_pass
-      - build_pass
-      - security_pass
+    executor:
+      task_id: T_00005_validate_system_exec
+      agent: codex
+      instruction: Produce a validation report describing test, build, and security outcomes for the enforced contract.
+      timeout_seconds: 3600
+      max_retries: 1
+      inputs:
+        - artifact_key: patched_codebase
+          schema_ref: artifact_schema.json#/definitions/PatchedCodebase
+          source: stage_output
+          required: true
+        - artifact_key: enforced_contract
+          schema_ref: artifact_schema.json#/definitions/EnforcedContract
+          source: stage_output
+          required: true
+      outputs:
+        - artifact_key: validation_report
+          schema_ref: artifact_schema.json#/definitions/ValidationReport
+          required: true
+    validator:
+      task_id: T_00006_validate_system_val
+      agent: opencode
+      inputs:
+        - artifact_key: validation_report
+          schema_ref: artifact_schema.json#/definitions/ValidationReport
+          source: stage_output
+          required: true
+      checks:
+        - check_id: C_00006_tests_pass
+          check_name: tests_pass
+          artifact_key: validation_report
+          rule: validation_report_tests_pass
+          timeout_seconds: 300
+          failure_mode: reject_task
+        - check_id: C_00007_build_pass
+          check_name: build_pass
+          artifact_key: validation_report
+          rule: validation_report_build_success
+          timeout_seconds: 300
+          failure_mode: reject_task
+        - check_id: C_00008_security_pass
+          check_name: security_pass
+          artifact_key: validation_report
+          rule: validation_report_security_clean
+          timeout_seconds: 300
+          failure_mode: reject_task
 
   - name: finalize_output
-    agent: antigravity
-    description: Emit the constrained final artifact set only after validation has passed.
+    description: Emit the constrained final change record after all prior validation gates open.
     depends_on:
       - validate_system
-    inputs:
-      - validation_report
-    outputs:
-      - change_record
-    checks:
-      - output_format_enforced
+    executor:
+      task_id: T_00007_finalize_output_exec
+      agent: codex
+      instruction: Produce the final change record from the approved validation report without adding new scope.
+      timeout_seconds: 600
+      max_retries: 0
+      inputs:
+        - artifact_key: validation_report
+          schema_ref: artifact_schema.json#/definitions/ValidationReport
+          source: stage_output
+          required: true
+      outputs:
+        - artifact_key: change_record
+          schema_ref: artifact_schema.json#/definitions/ChangeRecord
+          required: true
+    validator:
+      task_id: T_00008_finalize_output_val
+      agent: opencode
+      inputs:
+        - artifact_key: change_record
+          schema_ref: artifact_schema.json#/definitions/ChangeRecord
+          source: stage_output
+          required: true
+      checks:
+        - check_id: C_00009_output_format_enforced
+          check_name: output_format_enforced
+          artifact_key: change_record
+          rule: change_record_complete
+          timeout_seconds: 300
+          failure_mode: reject_task

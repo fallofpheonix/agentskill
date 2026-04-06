@@ -94,7 +94,11 @@ INSTRUCTION Test agent
         with tempfile.TemporaryDirectory() as temp_dir:
             requirements = AgentBuilder(config, temp_dir).framework.get_requirements()
 
-        assert requirements == ["fast-agent-mcp==0.2.33", "deprecated==1.2.18"]
+        assert requirements == [
+            "fast-agent-mcp==0.2.33",
+            "deprecated==1.2.18",
+            "jsonschema==4.25.1",
+        ]
 
     def test_fast_agent_config_generation(self):
         """Fast-agent config files are created and no alternate format is emitted."""

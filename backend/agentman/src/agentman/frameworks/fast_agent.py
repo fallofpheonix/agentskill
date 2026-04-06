@@ -16,6 +16,11 @@ class FastAgentFramework(BaseFramework):
         # Imports
         lines.extend([
             "import asyncio",
+            "import json",
+            "from pathlib import Path",
+            "",
+            "from agent_registry import AgentRegistry",
+            "from strict_executor import StrictExecutionEngine",
             "from mcp_agent.core.fastagent import FastAgent",
             "",
             "# Create the application",
@@ -31,9 +36,25 @@ class FastAgentFramework(BaseFramework):
         for orchestrator in self.config.orchestrators.values():
             lines.append(orchestrator.to_decorator_string(self.config.default_model))
 
+        lines.extend([
+            "",
+            "def load_execution_plan() -> dict:",
+            '    return json.loads(Path("execution_dag.json").read_text(encoding="utf-8"))',
+            "",
+            "def create_execution_engine(agent_handlers: dict | None = None) -> StrictExecutionEngine:",
+            "    execution_plan = load_execution_plan()",
+            "    registry = AgentRegistry.from_role_bindings(",
+            '        execution_plan["role_bindings"],',
+            "        handlers=agent_handlers,",
+            "    )",
+            "    return StrictExecutionEngine(execution_plan, registry)",
+            "",
+        ])
+
         # Main function
         lines.extend([
             "async def main() -> None:",
+            "    StrictExecutionEngine.validate_execution_plan(load_execution_plan())",
             "    async with fast.run() as agent:",
         ])
 
@@ -70,6 +91,7 @@ class FastAgentFramework(BaseFramework):
         requirements = [
             "fast-agent-mcp==0.2.33",
             "deprecated==1.2.18",
+            "jsonschema==4.25.1",
         ]
 
         # Add additional requirements based on servers used

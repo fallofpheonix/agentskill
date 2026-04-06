@@ -1,0 +1,212 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "StrictTriEngineTask",
+  "type": "object",
+  "required": [
+    "task_id",
+    "owner_agent",
+    "assigned_agent",
+    "stage_name",
+    "depends_on_tasks",
+    "input_artifacts",
+    "output_artifacts"
+  ],
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "pattern": "^T_[0-9]{5}_(analyze_repository|repair_core|validate_system|finalize_output)_(exec|val)$"
+    },
+    "owner_agent": {
+      "type": "string",
+      "enum": ["executor", "validator"]
+    },
+    "assigned_agent": {
+      "type": "string",
+      "minLength": 1
+    },
+    "stage_name": {
+      "type": "string",
+      "enum": [
+        "analyze_repository",
+        "repair_core",
+        "validate_system",
+        "finalize_output"
+      ]
+    },
+    "depends_on_tasks": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^T_[0-9]{5}_(analyze_repository|repair_core|validate_system|finalize_output)_(exec|val)$"
+      }
+    },
+    "input_artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["artifact_key", "schema_ref", "source"],
+        "properties": {
+          "artifact_key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "schema_ref": {
+            "type": "string",
+            "pattern": "^artifact_schema\\.json#/definitions/[A-Za-z][A-Za-z0-9]+$"
+          },
+          "source": {
+            "type": "string",
+            "enum": ["external", "stage_output"]
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "output_artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["artifact_key", "schema_ref"],
+        "properties": {
+          "artifact_key": {
+            "type": "string",
+            "minLength": 1
+          },
+          "schema_ref": {
+            "type": "string",
+            "pattern": "^artifact_schema\\.json#/definitions/[A-Za-z][A-Za-z0-9]+$"
+          },
+          "required": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "execution": {
+      "type": "object",
+      "required": ["instruction", "timeout_seconds", "max_retries", "recovery_strategy", "atomicity"],
+      "properties": {
+        "instruction": {
+          "type": "string",
+          "minLength": 10
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 60
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "recovery_strategy": {
+          "type": "string",
+          "enum": ["retry", "escalate"]
+        },
+        "atomicity": {
+          "type": "string",
+          "enum": ["all_or_nothing"]
+        }
+      },
+      "additionalProperties": false
+    },
+    "validation": {
+      "type": "object",
+      "required": ["checks", "all_checks_required"],
+      "properties": {
+        "checks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "check_id",
+              "check_name",
+              "artifact_key",
+              "rule",
+              "timeout_seconds",
+              "failure_mode"
+            ],
+            "properties": {
+              "check_id": {
+                "type": "string",
+                "pattern": "^C_[0-9]{5}_[a-z0-9_]+$"
+              },
+              "check_name": {
+                "type": "string",
+                "pattern": "^[a-z0-9_]+$"
+              },
+              "artifact_key": {
+                "type": "string",
+                "minLength": 1
+              },
+              "rule": {
+                "type": "string",
+                "pattern": "^[a-z0-9_]+$"
+              },
+              "timeout_seconds": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "failure_mode": {
+                "type": "string",
+                "enum": ["reject_task"]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "all_checks_required": {
+          "type": "boolean",
+          "const": true
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "owner_agent": {
+            "const": "executor"
+          }
+        }
+      },
+      "then": {
+        "required": ["execution"],
+        "properties": {
+          "task_id": {
+            "pattern": "^T_[0-9]{5}_(analyze_repository|repair_core|validate_system|finalize_output)_exec$"
+          },
+          "output_artifacts": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "owner_agent": {
+            "const": "validator"
+          }
+        }
+      },
+      "then": {
+        "required": ["validation"],
+        "properties": {
+          "task_id": {
+            "pattern": "^T_[0-9]{5}_(analyze_repository|repair_core|validate_system|finalize_output)_val$"
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

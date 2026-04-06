@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
 import yaml
 
 from agentman.agent_builder import AgentBuilder, build_from_agentfile
@@ -22,13 +23,151 @@ from agentman.agentfile_parser import (
     MCPServer,
     Agent,
     Orchestrator,
+    RoleBindings,
+    StageDefinition,
+    TaskDefinition,
+    TaskExecution,
+    TaskValidation,
+    ArtifactBinding,
+    ValidationCheck,
     SecretValue,
-    SecretContext
+    SecretContext,
 )
 
 
 class TestAgentBuilder:
     """Test suite for AgentBuilder class."""
+
+    def _attach_minimal_runtime(self):
+        """Attach a minimal strict orchestrator and task graph to the config."""
+        self.config.agents["antigravity"] = Agent("antigravity", instruction="Plan")
+        self.config.agents["codex"] = Agent("codex", instruction="Execute")
+        self.config.agents["opencode"] = Agent("opencode", instruction="Validate")
+        orchestrator = Orchestrator(
+            "tri_engine",
+            agents=["antigravity", "codex", "opencode"],
+            default=True,
+            role_bindings=RoleBindings(
+                orchestrator="antigravity",
+                executor="codex",
+                validator="opencode",
+            ),
+        )
+        analyze_exec = TaskDefinition(
+            task_id="T_00001_analyze_repository_exec",
+            owner_agent="executor",
+            assigned_agent="codex",
+            stage_name="analyze_repository",
+            input_artifacts=[
+                ArtifactBinding(
+                    artifact_key="external:repository",
+                    schema_ref="artifact_schema.json#/definitions/Repository",
+                    source="external",
+                )
+            ],
+            output_artifacts=[
+                ArtifactBinding(
+                    artifact_key="repo_inventory",
+                    schema_ref="artifact_schema.json#/definitions/RepoInventory",
+                    required=True,
+                )
+            ],
+            execution=TaskExecution(
+                instruction="Build the repository inventory from the tracked tree only.",
+                timeout_seconds=3600,
+                max_retries=1,
+            ),
+        )
+        analyze_val = TaskDefinition(
+            task_id="T_00002_analyze_repository_val",
+            owner_agent="validator",
+            assigned_agent="opencode",
+            stage_name="analyze_repository",
+            depends_on_tasks=["T_00001_analyze_repository_exec"],
+            input_artifacts=[
+                ArtifactBinding(
+                    artifact_key="repo_inventory",
+                    schema_ref="artifact_schema.json#/definitions/RepoInventory",
+                    source="stage_output",
+                )
+            ],
+            validation=TaskValidation(
+                checks=[
+                    ValidationCheck(
+                        check_id="C_00001_classification_complete",
+                        check_name="classification_complete",
+                        artifact_key="repo_inventory",
+                        rule="repo_inventory_components_classified",
+                        timeout_seconds=300,
+                    )
+                ]
+            ),
+        )
+        validate_exec = TaskDefinition(
+            task_id="T_00003_validate_system_exec",
+            owner_agent="executor",
+            assigned_agent="codex",
+            stage_name="validate_system",
+            depends_on_tasks=["T_00002_analyze_repository_val"],
+            input_artifacts=[
+                ArtifactBinding(
+                    artifact_key="repo_inventory",
+                    schema_ref="artifact_schema.json#/definitions/RepoInventory",
+                    source="stage_output",
+                )
+            ],
+            output_artifacts=[
+                ArtifactBinding(
+                    artifact_key="validation_report",
+                    schema_ref="artifact_schema.json#/definitions/ValidationReport",
+                    required=True,
+                )
+            ],
+            execution=TaskExecution(
+                instruction="Produce the validation report from the approved repository inventory.",
+                timeout_seconds=3600,
+                max_retries=1,
+            ),
+        )
+        validate_val = TaskDefinition(
+            task_id="T_00004_validate_system_val",
+            owner_agent="validator",
+            assigned_agent="opencode",
+            stage_name="validate_system",
+            depends_on_tasks=["T_00003_validate_system_exec"],
+            input_artifacts=[
+                ArtifactBinding(
+                    artifact_key="validation_report",
+                    schema_ref="artifact_schema.json#/definitions/ValidationReport",
+                    source="stage_output",
+                )
+            ],
+            validation=TaskValidation(
+                checks=[
+                    ValidationCheck(
+                        check_id="C_00002_tests_pass",
+                        check_name="tests_pass",
+                        artifact_key="validation_report",
+                        rule="validation_report_tests_pass",
+                        timeout_seconds=300,
+                    )
+                ]
+            ),
+        )
+        orchestrator.stages = [
+            StageDefinition(
+                name="analyze_repository",
+                executor_task=analyze_exec,
+                validator_task=analyze_val,
+            ),
+            StageDefinition(
+                name="validate_system",
+                depends_on=["analyze_repository"],
+                executor_task=validate_exec,
+                validator_task=validate_val,
+            ),
+        ]
+        self.config.orchestrators["tri_engine"] = orchestrator
 
     def setup_method(self):
         """Set up test fixtures."""
@@ -36,6 +175,7 @@ class TestAgentBuilder:
         self.config.base_image = "python:3.11-slim"
         self.config.default_model = "generic.qwen3:latest"
         self.config.cmd = ["python", "agent.py"]
+        self._attach_minimal_runtime()
 
     def test_init_default_output(self):
         """Test builder initialization with default output directory."""
@@ -71,12 +211,16 @@ class TestAgentBuilder:
 
         expected_lines = [
             "import asyncio",
+            "from agent_registry import AgentRegistry",
+            "from strict_executor import StrictExecutionEngine",
             "from mcp_agent.core.fastagent import FastAgent",
             "",
             "# Create the application",
             'fast = FastAgent("Generated by Agentman")',
             "",
+            "def load_execution_plan() -> dict:",
             "async def main() -> None:",
+            "    StrictExecutionEngine.validate_execution_plan(load_execution_plan())",
             "    async with fast.run() as agent:",
             "        await agent()",
             "",
@@ -333,17 +477,23 @@ class TestAgentBuilder:
             # Check that all expected files are created
             expected_files = [
                 "agent.py",
+                "strict_executor.py",
+                "agent_registry.py",
+                "schema_registry.py",
                 "fastagent.config.yaml",
                 "fastagent.secrets.yaml",
                 "orchestration.json",
+                "execution_dag.json",
                 "Dockerfile",
                 "requirements.txt",
-                ".dockerignore"
+                ".dockerignore",
             ]
 
             for filename in expected_files:
                 file_path = Path(temp_dir) / filename
                 assert file_path.exists(), f"File {filename} was not created"
+            assert (Path(temp_dir) / "schemas" / "task_schema.json").exists()
+            assert (Path(temp_dir) / "schemas" / "artifact_schema.json").exists()
 
     @patch('agentman.agent_builder.AgentfileParser')
     def test_build_from_agentfile(self, mock_parser_class):
@@ -363,12 +513,16 @@ class TestAgentBuilder:
             # Check that files were created
             expected_files = [
                 "agent.py",
+                "strict_executor.py",
+                "agent_registry.py",
+                "schema_registry.py",
                 "fastagent.config.yaml",
                 "fastagent.secrets.yaml",
                 "orchestration.json",
+                "execution_dag.json",
                 "Dockerfile",
                 "requirements.txt",
-                ".dockerignore"
+                ".dockerignore",
             ]
 
             for filename in expected_files:
@@ -437,28 +591,14 @@ class TestAgentBuilderEdgeCases:
     """Test edge cases and error conditions for AgentBuilder."""
 
     def test_empty_config(self):
-        """Test builder with minimal empty configuration."""
+        """An empty config cannot produce a strict execution plan."""
         config = AgentfileConfig()
         builder = AgentBuilder(config)
 
         with tempfile.TemporaryDirectory() as temp_dir:
             builder.output_dir = Path(temp_dir)
-            builder.build_all()
-
-            # Should still create all files even with empty config
-            expected_files = [
-                "agent.py",
-                "fastagent.config.yaml",
-                "fastagent.secrets.yaml",
-                "orchestration.json",
-                "Dockerfile",
-                "requirements.txt",
-                ".dockerignore"
-            ]
-
-            for filename in expected_files:
-                file_path = Path(temp_dir) / filename
-                assert file_path.exists()
+            with pytest.raises(ValueError, match="requires one orchestrator"):
+                builder.build_all()
 
     def test_no_default_model(self):
         """Test builder behavior when no default model is specified."""

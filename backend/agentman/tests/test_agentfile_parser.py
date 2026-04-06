@@ -23,8 +23,87 @@ from agentman.agentfile_parser import (
     Agent,
     Orchestrator,
     SecretValue,
-    SecretContext
+    SecretContext,
 )
+
+
+def write_strict_stage_schema(path: Path, *, include_dependency: bool = True) -> None:
+    """Write a minimal strict stage schema."""
+    validate_depends = "    depends_on:\n      - analyze_repository\n" if include_dependency else ""
+    path.write_text(
+        (
+            "version: 1\n"
+            "roles:\n"
+            "  orchestrator: antigravity\n"
+            "  executor: codex\n"
+            "  validator: opencode\n"
+            "stages:\n"
+            "  - name: analyze_repository\n"
+            "    executor:\n"
+            "      task_id: T_00001_analyze_repository_exec\n"
+            "      agent: codex\n"
+            "      instruction: Build the repository inventory, conflict report, and deletion plan.\n"
+            "      timeout_seconds: 3600\n"
+            "      max_retries: 1\n"
+            "      inputs:\n"
+            "        - artifact_key: external:repository\n"
+            "          schema_ref: artifact_schema.json#/definitions/Repository\n"
+            "          source: external\n"
+            "          required: true\n"
+            "      outputs:\n"
+            "        - artifact_key: repo_inventory\n"
+            "          schema_ref: artifact_schema.json#/definitions/RepoInventory\n"
+            "          required: true\n"
+            "    validator:\n"
+            "      task_id: T_00002_analyze_repository_val\n"
+            "      agent: opencode\n"
+            "      inputs:\n"
+            "        - artifact_key: repo_inventory\n"
+            "          schema_ref: artifact_schema.json#/definitions/RepoInventory\n"
+            "          source: stage_output\n"
+            "          required: true\n"
+            "      checks:\n"
+            "        - check_id: C_00001_classification_complete\n"
+            "          check_name: classification_complete\n"
+            "          artifact_key: repo_inventory\n"
+            "          rule: repo_inventory_components_classified\n"
+            "          timeout_seconds: 300\n"
+            "          failure_mode: reject_task\n"
+            "  - name: validate_system\n"
+            f"{validate_depends}"
+            "    executor:\n"
+            "      task_id: T_00003_validate_system_exec\n"
+            "      agent: codex\n"
+            "      instruction: Produce a validation report from the approved repository inventory.\n"
+            "      timeout_seconds: 3600\n"
+            "      max_retries: 1\n"
+            "      inputs:\n"
+            "        - artifact_key: repo_inventory\n"
+            "          schema_ref: artifact_schema.json#/definitions/RepoInventory\n"
+            "          source: stage_output\n"
+            "          required: true\n"
+            "      outputs:\n"
+            "        - artifact_key: validation_report\n"
+            "          schema_ref: artifact_schema.json#/definitions/ValidationReport\n"
+            "          required: true\n"
+            "    validator:\n"
+            "      task_id: T_00004_validate_system_val\n"
+            "      agent: opencode\n"
+            "      inputs:\n"
+            "        - artifact_key: validation_report\n"
+            "          schema_ref: artifact_schema.json#/definitions/ValidationReport\n"
+            "          source: stage_output\n"
+            "          required: true\n"
+            "      checks:\n"
+            "        - check_id: C_00002_tests_pass\n"
+            "          check_name: tests_pass\n"
+            "          artifact_key: validation_report\n"
+            "          rule: validation_report_tests_pass\n"
+            "          timeout_seconds: 300\n"
+            "          failure_mode: reject_task\n"
+        ),
+        encoding="utf-8",
+    )
 
 
 class TestAgentfileParser:
@@ -126,37 +205,20 @@ EXPOSE 8080
         """Test parsing an Agentfile with an external stage schema."""
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            stage_schema = temp_path / "stages.yaml"
-            stage_schema.write_text(
-                """
-version: 1
-stages:
-  - name: analyze
-    agent: antigravity
-    inputs: [external:repository]
-    outputs: [repo_inventory]
-    checks: [classification_complete]
-  - name: validate
-    agent: opencode
-    depends_on: [analyze]
-    inputs: [repo_inventory]
-    outputs: [validation_report]
-    checks: [tests_pass]
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
+            write_strict_stage_schema(temp_path / "stages.yaml")
 
             agentfile = temp_path / "Agentfile"
             agentfile.write_text(
                 """
 FRAMEWORK fast-agent
 AGENT antigravity
-INSTRUCTION Analyze
+INSTRUCTION Plan
+AGENT codex
+INSTRUCTION Execute
 AGENT opencode
 INSTRUCTION Validate
 ORCHESTRATOR tri_engine
-AGENTS antigravity opencode
+AGENTS antigravity codex opencode
 STAGE_SCHEMA stages.yaml
 DEFAULT 1
 """.strip()
@@ -168,8 +230,12 @@ DEFAULT 1
 
         orchestrator = config.orchestrators["tri_engine"]
         assert orchestrator.stage_schema == "stages.yaml"
-        assert [stage.name for stage in orchestrator.stages] == ["analyze", "validate"]
-        assert orchestrator.stages[1].depends_on == ["analyze"]
+        assert orchestrator.role_bindings.executor == "codex"
+        assert orchestrator.role_bindings.validator == "opencode"
+        assert [stage.name for stage in orchestrator.stages] == ["analyze_repository", "validate_system"]
+        assert orchestrator.stages[1].depends_on == ["analyze_repository"]
+        assert orchestrator.stages[0].executor_task.owner_agent == "executor"
+        assert orchestrator.stages[0].validator_task.owner_agent == "validator"
 
     def test_removed_workflow_instructions_are_rejected(self):
         """ROUTER and CHAIN are not part of the minimal supported surface."""
@@ -197,34 +263,19 @@ SEQUENCE antigravity
         """Test stage schema validation rejects artifact use without dependency linkage."""
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            (temp_path / "stages.yaml").write_text(
-                """
-version: 1
-stages:
-  - name: analyze
-    agent: antigravity
-    inputs: [external:repository]
-    outputs: [repo_inventory]
-    checks: [classification_complete]
-  - name: validate
-    agent: opencode
-    inputs: [repo_inventory]
-    outputs: [validation_report]
-    checks: [tests_pass]
-""".strip()
-                + "\n",
-                encoding="utf-8",
-            )
+            write_strict_stage_schema(temp_path / "stages.yaml", include_dependency=False)
 
             agentfile = temp_path / "Agentfile"
             agentfile.write_text(
                 """
 AGENT antigravity
-INSTRUCTION Analyze
+INSTRUCTION Plan
+AGENT codex
+INSTRUCTION Execute
 AGENT opencode
 INSTRUCTION Validate
 ORCHESTRATOR tri_engine
-AGENTS antigravity opencode
+AGENTS antigravity codex opencode
 STAGE_SCHEMA stages.yaml
 DEFAULT 1
 """.strip()
@@ -237,16 +288,25 @@ DEFAULT 1
 
     def test_model_subinstruction_within_orchestrator(self):
         """MODEL inside ORCHESTRATOR context should not overwrite the global model."""
-        config = self.parser.parse_content(
-            """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            write_strict_stage_schema(temp_path / "stages.yaml")
+            config = self.parser.parse_content(
+                """
 MODEL anthropic/claude-3-haiku-20240307
 AGENT antigravity
-INSTRUCTION Analyze
+INSTRUCTION Plan
+AGENT codex
+INSTRUCTION Execute
+AGENT opencode
+INSTRUCTION Validate
 ORCHESTRATOR tri_engine
-AGENTS antigravity
+AGENTS antigravity codex opencode
+STAGE_SCHEMA stages.yaml
 MODEL anthropic/claude-3-sonnet-20241022
-"""
-        )
+""",
+                base_dir=temp_path,
+            )
 
         assert config.default_model == "anthropic/claude-3-haiku-20240307"
         assert config.orchestrators["tri_engine"].model == "anthropic/claude-3-sonnet-20241022"
@@ -431,21 +491,14 @@ CMD ["python", "app.py"]
             self._validate_instruction(config.dockerfile_instructions, i, expected_instruction, expected_args)
 
     def test_parse_content_with_unknown_instruction(self):
-        """Test parsing content with an unknown instruction (should be treated as Dockerfile instruction)."""
-        content = """
+        """Unknown instructions are rejected instead of silently entering the Dockerfile."""
+        with pytest.raises(ValueError, match="Unsupported top-level instruction: UNKNOWN"):
+            self.parser.parse_content(
+                """
 FROM python:3.11-slim
 UNKNOWN INSTRUCTION args
 """
-        config = self.parser.parse_content(content)
-
-        # Unknown instructions should be treated as Dockerfile instructions
-        assert len(config.dockerfile_instructions) == 2  # FROM and UNKNOWN
-
-        unknown_instruction = self._find_instruction_by_type(config.dockerfile_instructions, "UNKNOWN")
-
-        assert unknown_instruction is not None
-        assert unknown_instruction.instruction == "UNKNOWN"
-        assert unknown_instruction.args == ["INSTRUCTION", "args"]
+            )
 
     def test_parse_content_without_from_instruction(self):
         """Test parsing content without FROM instruction (should still work)."""

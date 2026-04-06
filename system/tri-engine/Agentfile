@@ -7,7 +7,7 @@ SECRET ANTHROPIC_API_KEY
 WORKDIR /workspace
 
 AGENT antigravity
-INSTRUCTION Classify repository state, enforce stage ordering, and reject undocumented scope changes.
+INSTRUCTION Build the execution plan, enforce declared dependencies, and gate stage transitions after validator approval only.
 SERVERS filesystem commands
 USE_HISTORY true
 HUMAN_INPUT false

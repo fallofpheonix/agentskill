@@ -2,14 +2,17 @@
 
 import argparse
 import errno
+import json
 import shutil
 import sys
 import tempfile
 from pathlib import Path
 
-from agentman.agent_builder import build_from_agentfile
+from agentman.agent_builder import AgentBuilder, build_from_agentfile
+from agentman.agent_registry import AgentRegistry
 from agentman.agentfile_parser import AgentfileParser
 from agentman.common import perror
+from agentman.strict_executor import StrictExecutionEngine
 from agentman.version import print_version
 
 
@@ -62,6 +65,59 @@ def validate_cli(args: argparse.Namespace) -> None:
             print(f"   - stages: {len(orchestrator.stages)}")
 
 
+def _artifact_filename(artifact_key: str) -> str:
+    """Convert an artifact key to a deterministic filename."""
+    return artifact_key.replace(":", "__") + ".json"
+
+
+def execute_cli(args: argparse.Namespace) -> None:
+    """Execute the strict DAG against deterministic JSON artifacts."""
+    context_path = resolve_context_path(args.path)
+    agentfile_path = context_path / args.file
+    if not agentfile_path.exists():
+        raise ValueError(f"Agentfile not found: {agentfile_path}")
+
+    artifact_dir = Path(args.artifacts).resolve()
+    if not artifact_dir.exists():
+        raise ValueError(f"Artifact directory not found: {artifact_dir}")
+
+    parser = AgentfileParser()
+    config = parser.parse_file(str(agentfile_path))
+    builder = AgentBuilder(config, output_dir=context_path / ".agentman-exec", source_dir=context_path)
+    execution_plan = builder._build_execution_plan()
+    StrictExecutionEngine.validate_execution_plan(execution_plan)
+
+    initial_artifacts = {}
+    for task in execution_plan["execution_plan"]["tasks"]:
+        for artifact in task["input_artifacts"]:
+            if artifact["source"] != "external":
+                continue
+            path = artifact_dir / _artifact_filename(artifact["artifact_key"])
+            if not path.exists():
+                raise ValueError(f"Missing external artifact payload: {path}")
+            initial_artifacts[artifact["artifact_key"]] = json.loads(path.read_text(encoding="utf-8"))
+
+    def executor_handler(task: dict, _inputs: dict, _attempt: int) -> dict:
+        outputs = {}
+        for artifact in task["output_artifacts"]:
+            path = artifact_dir / _artifact_filename(artifact["artifact_key"])
+            if not path.exists():
+                raise ValueError(f"Missing executor output payload: {path}")
+            outputs[artifact["artifact_key"]] = json.loads(path.read_text(encoding="utf-8"))
+        return outputs
+
+    registry = AgentRegistry.from_role_bindings(execution_plan["role_bindings"])
+    engine = StrictExecutionEngine(execution_plan, registry)
+    result = engine.execute(executor_handler, initial_artifacts=initial_artifacts)
+
+    if args.quiet:
+        return
+
+    print(f"✅ Executed strict DAG: {agentfile_path}")
+    print(f"   - approved artifacts: {len(result['approved_artifacts'])}")
+    print(f"   - messages: {len(result['message_log'])}")
+
+
 def create_parser() -> argparse.ArgumentParser:
     """Create the CLI parser."""
     parser = argparse.ArgumentParser(
@@ -88,6 +144,19 @@ def create_parser() -> argparse.ArgumentParser:
     )
     validate_parser.add_argument("path", nargs="?", default=".", help="validation context directory")
     validate_parser.set_defaults(func=validate_cli)
+
+    execute_parser = subparsers.add_parser(
+        "execute",
+        help="execute the strict DAG using deterministic JSON artifact payloads",
+    )
+    execute_parser.add_argument("-f", "--file", default="Agentfile", help="name of the Agentfile")
+    execute_parser.add_argument(
+        "--artifacts",
+        required=True,
+        help="directory containing artifact payload JSON files",
+    )
+    execute_parser.add_argument("path", nargs="?", default=".", help="execution context directory")
+    execute_parser.set_defaults(func=execute_cli)
 
     version_parser = subparsers.add_parser("version", help="show the Agentman version information")
     version_parser.set_defaults(func=print_version)

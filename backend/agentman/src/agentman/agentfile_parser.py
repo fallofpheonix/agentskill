@@ -1,11 +1,18 @@
 """Agentfile parser module for parsing Agentfile configurations."""
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Union
 
 import yaml
+
+from agentman.schema_registry import (
+    SchemaRegistryError,
+    validate_artifact_schema_ref,
+    validate_task_definition,
+)
 
 
 @dataclass
@@ -83,6 +90,7 @@ class Orchestrator:
     human_input: bool = False
     default: bool = False
     stage_schema: Optional[str] = None
+    role_bindings: Optional["RoleBindings"] = None
     stages: List["StageDefinition"] = field(default_factory=list)
 
     def to_decorator_string(self, default_model: Optional[str] = None) -> str:
@@ -154,19 +162,135 @@ class DockerfileInstruction:
 
 @dataclass
 class StageDefinition:
-    """Represents an executable orchestrator stage."""
+    """Represents a strict stage with dedicated executor and validator tasks."""
 
     name: str
-    agent: str
-    inputs: List[str] = field(default_factory=list)
-    outputs: List[str] = field(default_factory=list)
-    checks: List[str] = field(default_factory=list)
-    depends_on: List[str] = field(default_factory=list)
     description: Optional[str] = None
+    depends_on: List[str] = field(default_factory=list)
+    executor_task: "TaskDefinition" = None  # type: ignore[assignment]
+    validator_task: "TaskDefinition" = None  # type: ignore[assignment]
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert stage definition to a serializable dictionary."""
+        return {
+            "name": self.name,
+            "description": self.description,
+            "depends_on": self.depends_on,
+            "executor": self.executor_task.to_dict(),
+            "validator": self.validator_task.to_dict(),
+        }
+
+
+@dataclass
+class RoleBindings:
+    """Maps configured agents to strict runtime roles."""
+
+    orchestrator: str
+    executor: str
+    validator: str
+
+    def to_dict(self) -> Dict[str, str]:
+        """Convert role bindings to a serializable mapping."""
         return asdict(self)
+
+
+@dataclass
+class ArtifactBinding:
+    """An artifact contract used by a task."""
+
+    artifact_key: str
+    schema_ref: str
+    source: Optional[str] = None
+    required: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the artifact binding to a serializable mapping."""
+        payload = {
+            "artifact_key": self.artifact_key,
+            "schema_ref": self.schema_ref,
+            "required": self.required,
+        }
+        if self.source is not None:
+            payload["source"] = self.source
+        return payload
+
+
+@dataclass
+class ValidationCheck:
+    """A machine-enforceable validation check."""
+
+    check_id: str
+    check_name: str
+    artifact_key: str
+    rule: str
+    timeout_seconds: int
+    failure_mode: str = "reject_task"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the validation check to a serializable mapping."""
+        return asdict(self)
+
+
+@dataclass
+class TaskExecution:
+    """Executor-owned task execution settings."""
+
+    instruction: str
+    timeout_seconds: int
+    max_retries: int
+    recovery_strategy: str = "retry"
+    atomicity: str = "all_or_nothing"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert execution settings to a serializable mapping."""
+        return asdict(self)
+
+
+@dataclass
+class TaskValidation:
+    """Validator-owned task validation settings."""
+
+    checks: List[ValidationCheck] = field(default_factory=list)
+    all_checks_required: bool = True
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert validation settings to a serializable mapping."""
+        return {
+            "checks": [check.to_dict() for check in self.checks],
+            "all_checks_required": self.all_checks_required,
+        }
+
+
+@dataclass
+class TaskDefinition:
+    """A strict executor or validator task."""
+
+    task_id: str
+    owner_agent: str
+    assigned_agent: str
+    stage_name: str
+    depends_on_tasks: List[str] = field(default_factory=list)
+    input_artifacts: List[ArtifactBinding] = field(default_factory=list)
+    output_artifacts: List[ArtifactBinding] = field(default_factory=list)
+    execution: Optional[TaskExecution] = None
+    validation: Optional[TaskValidation] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert task definition to a serializable mapping."""
+        payload = {
+            "task_id": self.task_id,
+            "owner_agent": self.owner_agent,
+            "assigned_agent": self.assigned_agent,
+            "stage_name": self.stage_name,
+            "depends_on_tasks": self.depends_on_tasks,
+            "input_artifacts": [artifact.to_dict() for artifact in self.input_artifacts],
+            "output_artifacts": [artifact.to_dict() for artifact in self.output_artifacts],
+        }
+        if self.execution is not None:
+            payload["execution"] = self.execution.to_dict()
+        if self.validation is not None:
+            payload["validation"] = self.validation.to_dict()
+        return payload
 
 
 @dataclass
@@ -362,9 +486,7 @@ class AgentfileParser:
             elif self.current_context:
                 raise ValueError(f"Unsupported {self.current_context.upper()} sub-instruction: {instruction}")
             else:
-                # Unknown top-level instructions are preserved as Dockerfile lines
-                # for forward compatibility with the container surface.
-                self._handle_dockerfile_instruction(instruction, parts)
+                raise ValueError(f"Unsupported top-level instruction: {instruction}")
 
     def _split_respecting_quotes(self, line: str) -> List[str]:
         """Split line by whitespace but respect quoted strings."""
@@ -724,6 +846,9 @@ class AgentfileParser:
         """Validate cross-reference integrity for the parsed configuration."""
         self._validate_agent_servers()
         self._validate_orchestrator_references(base_dir)
+        self._validate_role_separation()
+        self._validate_task_ownership()
+        self._validate_no_overlap()
 
     def _validate_agent_servers(self) -> None:
         """Ensure each referenced server exists."""
@@ -744,10 +869,15 @@ class AgentfileParser:
                 raise ValueError(
                     f"Orchestrator {orchestrator.name} references undefined agents: {', '.join(missing_agents)}"
                 )
-            if orchestrator.stage_schema:
-                orchestrator.stages = self._load_stage_schema(orchestrator, base_dir)
+            if not orchestrator.stage_schema:
+                raise ValueError(f"Orchestrator {orchestrator.name} must declare STAGE_SCHEMA")
+            orchestrator.role_bindings, orchestrator.stages = self._load_stage_schema(orchestrator, base_dir)
 
-    def _load_stage_schema(self, orchestrator: Orchestrator, base_dir: Optional[Path]) -> List[StageDefinition]:
+    def _load_stage_schema(
+        self,
+        orchestrator: Orchestrator,
+        base_dir: Optional[Path],
+    ) -> tuple[RoleBindings, List[StageDefinition]]:
         """Load and validate an orchestrator stage schema."""
         if base_dir is None:
             raise ValueError(f"Orchestrator {orchestrator.name} requires a file-backed parse for STAGE_SCHEMA")
@@ -762,6 +892,7 @@ class AgentfileParser:
         if not isinstance(raw, dict):
             raise ValueError(f"Stage schema must be a mapping: {schema_path}")
 
+        role_bindings = self._parse_role_bindings(raw.get("roles"), orchestrator, schema_path)
         raw_stages = raw.get("stages")
         if not isinstance(raw_stages, list) or not raw_stages:
             raise ValueError(f"Stage schema {schema_path} must define a non-empty 'stages' list")
@@ -769,31 +900,30 @@ class AgentfileParser:
         stages: List[StageDefinition] = []
         seen_stage_names: Set[str] = set()
         produced_artifacts: Dict[str, str] = {}
+        stage_by_name: Dict[str, StageDefinition] = {}
 
         for index, item in enumerate(raw_stages, start=1):
-            stage = self._parse_stage_definition(item, index)
+            stage = self._parse_stage_definition(item, index, role_bindings)
             if stage.name in seen_stage_names:
                 raise ValueError(f"Duplicate stage name in {schema_path}: {stage.name}")
-            if stage.agent not in orchestrator.agents:
-                raise ValueError(
-                    f"Stage {stage.name} uses agent {stage.agent} outside orchestrator {orchestrator.name}"
-                )
-            if stage.agent not in self.config.agents:
-                raise ValueError(f"Stage {stage.name} references undefined agent {stage.agent}")
             invalid_dependencies = [name for name in stage.depends_on if name not in seen_stage_names]
             if invalid_dependencies:
                 raise ValueError(
                     f"Stage {stage.name} has invalid depends_on entries: {', '.join(invalid_dependencies)}"
                 )
 
-            internal_inputs = [artifact for artifact in stage.inputs if not artifact.startswith("external:")]
+            dependency_closure = self._resolve_stage_dependencies(stage_by_name, stage.depends_on)
+            internal_inputs = [
+                artifact.artifact_key
+                for artifact in stage.executor_task.input_artifacts
+                if artifact.source == "stage_output"
+            ]
             unresolved_inputs = [artifact for artifact in internal_inputs if artifact not in produced_artifacts]
             if unresolved_inputs:
                 raise ValueError(
                     f"Stage {stage.name} requires artifacts not produced earlier: {', '.join(unresolved_inputs)}"
                 )
 
-            dependency_closure = self._resolve_stage_dependencies(stages, stage.depends_on)
             for artifact in internal_inputs:
                 producer = produced_artifacts[artifact]
                 if producer not in dependency_closure:
@@ -801,54 +931,95 @@ class AgentfileParser:
                         f"Stage {stage.name} consumes artifact {artifact} from {producer} without depending on it"
                     )
 
-            for artifact in stage.outputs:
-                if artifact.startswith("external:"):
+            self._validate_stage_task_links(stage, stage_by_name)
+            self._validate_task_schema(stage.executor_task)
+            self._validate_task_schema(stage.validator_task)
+
+            for artifact in stage.executor_task.output_artifacts:
+                if artifact.artifact_key.startswith("external:"):
                     raise ValueError(f"Stage {stage.name} output cannot use reserved external: prefix")
-                if artifact in produced_artifacts:
+                if artifact.artifact_key in produced_artifacts:
                     raise ValueError(
-                        f"Artifact {artifact} is produced by both {produced_artifacts[artifact]} and {stage.name}"
+                        f"Artifact {artifact.artifact_key} is produced by both "
+                        f"{produced_artifacts[artifact.artifact_key]} and {stage.name}"
                     )
-                produced_artifacts[artifact] = stage.name
+                produced_artifacts[artifact.artifact_key] = stage.name
 
             stages.append(stage)
             seen_stage_names.add(stage.name)
+            stage_by_name[stage.name] = stage
 
-        return stages
+        return role_bindings, stages
 
-    def _parse_stage_definition(self, item: Any, index: int) -> StageDefinition:
+    def _parse_role_bindings(
+        self,
+        value: Any,
+        orchestrator: Orchestrator,
+        schema_path: Path,
+    ) -> RoleBindings:
+        """Parse and validate top-level role bindings."""
+        if not isinstance(value, dict):
+            raise ValueError(f"Stage schema {schema_path} must define roles mapping")
+
+        required_roles = {"orchestrator", "executor", "validator"}
+        missing = sorted(required_roles - set(value))
+        if missing:
+            raise ValueError(f"Stage schema {schema_path} is missing role bindings: {', '.join(missing)}")
+
+        bindings = RoleBindings(
+            orchestrator=self._require_string(value["orchestrator"], "roles.orchestrator"),
+            executor=self._require_string(value["executor"], "roles.executor"),
+            validator=self._require_string(value["validator"], "roles.validator"),
+        )
+        members = [bindings.orchestrator, bindings.executor, bindings.validator]
+        if len(set(members)) != len(members):
+            raise ValueError("roles.orchestrator, roles.executor, and roles.validator must be distinct agents")
+        for agent_name in members:
+            if agent_name not in orchestrator.agents:
+                raise ValueError(
+                    f"Role binding {agent_name} is outside orchestrator {orchestrator.name} agent set"
+                )
+            if agent_name not in self.config.agents:
+                raise ValueError(f"Role binding references undefined agent {agent_name}")
+        return bindings
+
+    def _parse_stage_definition(
+        self,
+        item: Any,
+        index: int,
+        role_bindings: RoleBindings,
+    ) -> StageDefinition:
         """Parse and validate a single stage definition."""
         if not isinstance(item, dict):
             raise ValueError(f"Stage entry #{index} must be a mapping")
 
-        required_keys = {"name", "agent", "inputs", "outputs", "checks"}
+        required_keys = {"name", "executor", "validator"}
         missing = sorted(required_keys - set(item))
         if missing:
             raise ValueError(f"Stage entry #{index} is missing required keys: {', '.join(missing)}")
 
-        stage = StageDefinition(
-            name=self._require_string(item["name"], f"stage[{index}].name"),
-            agent=self._require_string(item["agent"], f"stage[{index}].agent"),
-            inputs=self._require_string_list(item["inputs"], f"stage[{index}].inputs"),
-            outputs=self._require_string_list(item["outputs"], f"stage[{index}].outputs"),
-            checks=self._require_string_list(item["checks"], f"stage[{index}].checks"),
-            depends_on=self._require_string_list(item.get("depends_on", []), f"stage[{index}].depends_on"),
+        stage_name = self._require_stage_name(item["name"], f"stage[{index}].name")
+        executor_task = self._parse_executor_task(item["executor"], index, stage_name, role_bindings.executor)
+        validator_task = self._parse_validator_task(item["validator"], index, stage_name, role_bindings.validator)
+
+        return StageDefinition(
+            name=stage_name,
             description=(
                 self._require_string(item["description"], f"stage[{index}].description")
                 if "description" in item and item["description"] is not None
                 else None
             ),
+            depends_on=self._require_string_list(item.get("depends_on", []), f"stage[{index}].depends_on"),
+            executor_task=executor_task,
+            validator_task=validator_task,
         )
 
-        if not stage.outputs:
-            raise ValueError(f"Stage {stage.name} must define at least one output artifact")
-        if not stage.checks:
-            raise ValueError(f"Stage {stage.name} must define at least one validation check")
-
-        return stage
-
-    def _resolve_stage_dependencies(self, stages: List[StageDefinition], depends_on: List[str]) -> Set[str]:
+    def _resolve_stage_dependencies(
+        self,
+        stages: Dict[str, StageDefinition],
+        depends_on: List[str],
+    ) -> Set[str]:
         """Resolve the transitive dependency closure for a stage."""
-        stage_by_name = {stage.name: stage for stage in stages}
         resolved: Set[str] = set()
         stack = list(depends_on)
 
@@ -857,9 +1028,229 @@ class AgentfileParser:
             if stage_name in resolved:
                 continue
             resolved.add(stage_name)
-            stack.extend(stage_by_name[stage_name].depends_on)
+            stack.extend(stages[stage_name].depends_on)
 
         return resolved
+
+    def _parse_executor_task(
+        self,
+        value: Any,
+        index: int,
+        stage_name: str,
+        expected_agent: str,
+    ) -> TaskDefinition:
+        """Parse an executor task from stage schema."""
+        if not isinstance(value, dict):
+            raise ValueError(f"stage[{index}].executor must be a mapping")
+
+        agent = self._require_string(value.get("agent"), f"stage[{index}].executor.agent")
+        if agent != expected_agent:
+            raise ValueError(
+                f"Stage {stage_name} executor agent must be {expected_agent}, found {agent}"
+            )
+
+        inputs = self._parse_input_artifacts(value.get("inputs"), f"stage[{index}].executor.inputs")
+        outputs = self._parse_output_artifacts(value.get("outputs"), f"stage[{index}].executor.outputs")
+        execution = TaskExecution(
+            instruction=self._require_string(
+                value.get("instruction"), f"stage[{index}].executor.instruction"
+            ),
+            timeout_seconds=self._require_int(
+                value.get("timeout_seconds"), f"stage[{index}].executor.timeout_seconds", minimum=60
+            ),
+            max_retries=self._require_int(
+                value.get("max_retries"), f"stage[{index}].executor.max_retries", minimum=0, maximum=3
+            ),
+        )
+        return TaskDefinition(
+            task_id=self._require_task_id(
+                value.get("task_id"),
+                stage_name,
+                "exec",
+                f"stage[{index}].executor.task_id",
+            ),
+            owner_agent="executor",
+            assigned_agent=agent,
+            stage_name=stage_name,
+            input_artifacts=inputs,
+            output_artifacts=outputs,
+            execution=execution,
+        )
+
+    def _parse_validator_task(
+        self,
+        value: Any,
+        index: int,
+        stage_name: str,
+        expected_agent: str,
+    ) -> TaskDefinition:
+        """Parse a validator task from stage schema."""
+        if not isinstance(value, dict):
+            raise ValueError(f"stage[{index}].validator must be a mapping")
+
+        agent = self._require_string(value.get("agent"), f"stage[{index}].validator.agent")
+        if agent != expected_agent:
+            raise ValueError(
+                f"Stage {stage_name} validator agent must be {expected_agent}, found {agent}"
+            )
+
+        checks = self._parse_validation_checks(value.get("checks"), f"stage[{index}].validator.checks")
+        inputs = self._parse_input_artifacts(value.get("inputs"), f"stage[{index}].validator.inputs")
+        return TaskDefinition(
+            task_id=self._require_task_id(
+                value.get("task_id"),
+                stage_name,
+                "val",
+                f"stage[{index}].validator.task_id",
+            ),
+            owner_agent="validator",
+            assigned_agent=agent,
+            stage_name=stage_name,
+            input_artifacts=inputs,
+            output_artifacts=[],
+            validation=TaskValidation(checks=checks, all_checks_required=True),
+        )
+
+    def _parse_input_artifacts(self, value: Any, field_name: str) -> List[ArtifactBinding]:
+        """Parse input artifact bindings."""
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{field_name} must be a non-empty list")
+        artifacts: List[ArtifactBinding] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(f"{field_name}[{index}] must be a mapping")
+            artifact = ArtifactBinding(
+                artifact_key=self._require_string(item.get("artifact_key"), f"{field_name}[{index}].artifact_key"),
+                schema_ref=self._require_string(item.get("schema_ref"), f"{field_name}[{index}].schema_ref"),
+                source=self._require_source(item.get("source"), f"{field_name}[{index}].source"),
+                required=self._require_bool(item.get("required", True), f"{field_name}[{index}].required"),
+            )
+            self._validate_artifact_binding(artifact, allow_external=artifact.source == "external")
+            artifacts.append(artifact)
+        return artifacts
+
+    def _parse_output_artifacts(self, value: Any, field_name: str) -> List[ArtifactBinding]:
+        """Parse output artifact bindings."""
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{field_name} must be a non-empty list")
+        artifacts: List[ArtifactBinding] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(f"{field_name}[{index}] must be a mapping")
+            artifact = ArtifactBinding(
+                artifact_key=self._require_string(item.get("artifact_key"), f"{field_name}[{index}].artifact_key"),
+                schema_ref=self._require_string(item.get("schema_ref"), f"{field_name}[{index}].schema_ref"),
+                required=self._require_bool(item.get("required", True), f"{field_name}[{index}].required"),
+            )
+            self._validate_artifact_binding(artifact, allow_external=False)
+            artifacts.append(artifact)
+        return artifacts
+
+    def _parse_validation_checks(self, value: Any, field_name: str) -> List[ValidationCheck]:
+        """Parse machine-enforceable validation checks."""
+        if not isinstance(value, list) or not value:
+            raise ValueError(f"{field_name} must be a non-empty list")
+        checks: List[ValidationCheck] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, dict):
+                raise ValueError(f"{field_name}[{index}] must be a mapping")
+            checks.append(
+                ValidationCheck(
+                    check_id=self._require_check_id(item.get("check_id"), f"{field_name}[{index}].check_id"),
+                    check_name=self._require_identifier(
+                        item.get("check_name"), f"{field_name}[{index}].check_name"
+                    ),
+                    artifact_key=self._require_string(
+                        item.get("artifact_key"), f"{field_name}[{index}].artifact_key"
+                    ),
+                    rule=self._require_identifier(item.get("rule"), f"{field_name}[{index}].rule"),
+                    timeout_seconds=self._require_int(
+                        item.get("timeout_seconds"), f"{field_name}[{index}].timeout_seconds", minimum=1
+                    ),
+                    failure_mode=self._require_failure_mode(
+                        item.get("failure_mode", "reject_task"),
+                        f"{field_name}[{index}].failure_mode",
+                    ),
+                )
+            )
+        return checks
+
+    def _validate_stage_task_links(
+        self,
+        stage: StageDefinition,
+        prior_stages: Dict[str, StageDefinition],
+    ) -> None:
+        """Enforce executor/validator coupling for a stage."""
+        executor_outputs = {artifact.artifact_key for artifact in stage.executor_task.output_artifacts}
+        validator_inputs = {artifact.artifact_key for artifact in stage.validator_task.input_artifacts}
+        check_inputs = {check.artifact_key for check in stage.validator_task.validation.checks}  # type: ignore[union-attr]
+
+        if validator_inputs != executor_outputs:
+            raise ValueError(
+                f"Stage {stage.name} validator inputs must exactly match executor outputs"
+            )
+        if not check_inputs.issubset(executor_outputs):
+            missing = sorted(check_inputs - executor_outputs)
+            raise ValueError(
+                f"Stage {stage.name} validator checks reference artifacts not produced by executor: "
+                f"{', '.join(missing)}"
+            )
+
+        stage_dependency_task_ids = [prior_stages[dependency].validator_task.task_id for dependency in stage.depends_on]
+        stage.validator_task.depends_on_tasks = [stage.executor_task.task_id]
+        stage.executor_task.depends_on_tasks = stage_dependency_task_ids
+
+    def _validate_task_schema(self, task: TaskDefinition) -> None:
+        """Validate a task against the JSON task schema."""
+        try:
+            validate_task_definition(task.to_dict())
+        except SchemaRegistryError as exc:
+            raise ValueError(str(exc)) from exc
+
+    def _validate_role_separation(self) -> None:
+        """Ensure orchestrator, executor, and validator roles are exclusive."""
+        for orchestrator in self.config.orchestrators.values():
+            if orchestrator.role_bindings is None:
+                raise ValueError(f"Orchestrator {orchestrator.name} did not load role bindings")
+
+            bindings = orchestrator.role_bindings
+            members = [bindings.orchestrator, bindings.executor, bindings.validator]
+            if len(set(members)) != len(members):
+                raise ValueError(
+                    f"Orchestrator {orchestrator.name} has overlapping role assignments"
+                )
+
+    def _validate_task_ownership(self) -> None:
+        """Validate task ownership against strict role bindings."""
+        for orchestrator in self.config.orchestrators.values():
+            if orchestrator.role_bindings is None:
+                continue
+            bindings = orchestrator.role_bindings
+            for stage in orchestrator.stages:
+                if stage.executor_task.assigned_agent != bindings.executor:
+                    raise ValueError(
+                        f"Stage {stage.name} executor task is owned by {stage.executor_task.assigned_agent}, "
+                        f"expected {bindings.executor}"
+                    )
+                if stage.validator_task.assigned_agent != bindings.validator:
+                    raise ValueError(
+                        f"Stage {stage.name} validator task is owned by {stage.validator_task.assigned_agent}, "
+                        f"expected {bindings.validator}"
+                    )
+
+    def _validate_no_overlap(self) -> None:
+        """Reject task overlap or ambiguous stage ownership."""
+        for orchestrator in self.config.orchestrators.values():
+            seen_ids: Set[str] = set()
+            for stage in orchestrator.stages:
+                if stage.executor_task.task_id in seen_ids or stage.validator_task.task_id in seen_ids:
+                    raise ValueError(f"Duplicate task id detected in orchestrator {orchestrator.name}")
+                seen_ids.add(stage.executor_task.task_id)
+                seen_ids.add(stage.validator_task.task_id)
+                if stage.executor_task.assigned_agent == stage.validator_task.assigned_agent:
+                    raise ValueError(
+                        f"Stage {stage.name} assigns execution and validation to the same agent"
+                    )
 
     def _require_string(self, value: Any, field_name: str) -> str:
         """Validate that a field is a string."""
@@ -877,3 +1268,93 @@ class AgentfileParser:
                 raise ValueError(f"{field_name}[{index}] must be a non-empty string")
             result.append(item.strip())
         return result
+
+    def _require_identifier(self, value: Any, field_name: str) -> str:
+        """Validate that a field is a lowercase identifier."""
+        result = self._require_string(value, field_name)
+        if not re.fullmatch(r"[a-z0-9_]+", result):
+            raise ValueError(f"{field_name} must match [a-z0-9_]+")
+        return result
+
+    def _require_check_id(self, value: Any, field_name: str) -> str:
+        """Validate strict check identifiers."""
+        result = self._require_string(value, field_name)
+        if not re.fullmatch(r"C_[0-9]{5}_[a-z0-9_]+", result):
+            raise ValueError(f"{field_name} must match C_[0-9]{{5}}_<name>")
+        return result
+
+    def _require_task_id(
+        self,
+        value: Any,
+        stage_name: str,
+        suffix: str,
+        field_name: str,
+    ) -> str:
+        """Validate strict task identifiers."""
+        result = self._require_string(value, field_name)
+        expected = rf"T_[0-9]{{5}}_{stage_name}_{suffix}"
+        if not re.fullmatch(expected, result):
+            raise ValueError(f"{field_name} must match {expected}")
+        return result
+
+    def _require_stage_name(self, value: Any, field_name: str) -> str:
+        """Validate allowed strict stage names."""
+        result = self._require_string(value, field_name)
+        allowed = {
+            "analyze_repository",
+            "repair_core",
+            "validate_system",
+            "finalize_output",
+        }
+        if result not in allowed:
+            raise ValueError(f"{field_name} must be one of: {', '.join(sorted(allowed))}")
+        return result
+
+    def _require_source(self, value: Any, field_name: str) -> str:
+        """Validate supported artifact sources."""
+        result = self._require_string(value, field_name)
+        if result not in {"external", "stage_output"}:
+            raise ValueError(f"{field_name} must be 'external' or 'stage_output'")
+        return result
+
+    def _require_bool(self, value: Any, field_name: str) -> bool:
+        """Validate boolean values."""
+        if not isinstance(value, bool):
+            raise ValueError(f"{field_name} must be a boolean")
+        return value
+
+    def _require_int(
+        self,
+        value: Any,
+        field_name: str,
+        minimum: int,
+        maximum: Optional[int] = None,
+    ) -> int:
+        """Validate bounded integer values."""
+        if not isinstance(value, int):
+            raise ValueError(f"{field_name} must be an integer")
+        if value < minimum:
+            raise ValueError(f"{field_name} must be >= {minimum}")
+        if maximum is not None and value > maximum:
+            raise ValueError(f"{field_name} must be <= {maximum}")
+        return value
+
+    def _require_failure_mode(self, value: Any, field_name: str) -> str:
+        """Validate supported failure modes."""
+        result = self._require_string(value, field_name)
+        if result != "reject_task":
+            raise ValueError(f"{field_name} must be reject_task")
+        return result
+
+    def _validate_artifact_binding(self, artifact: ArtifactBinding, allow_external: bool) -> None:
+        """Validate a single artifact binding."""
+        if artifact.artifact_key.startswith("external:") and not allow_external:
+            raise ValueError(f"Artifact {artifact.artifact_key} cannot use external: prefix here")
+        if allow_external and not artifact.artifact_key.startswith("external:"):
+            raise ValueError(
+                f"External artifact {artifact.artifact_key} must use external: prefix"
+            )
+        try:
+            validate_artifact_schema_ref(artifact.schema_ref)
+        except SchemaRegistryError as exc:
+            raise ValueError(str(exc)) from exc
