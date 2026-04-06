@@ -9,20 +9,18 @@ python3 -m venv .venv-ci
 source .venv-ci/bin/activate
 
 python -m pip install --upgrade pip
-python -m pip install -e 'backend/agentman[dev]' build
+python -m pip install -e 'backend/agentman[dev]'
 
-npm ci --prefix docs/awesome-opencode
-npm ci --prefix frontend/open-antigravity/mitmserver
+bash ci_cd/validate_docs.sh
 
-npm run validate --prefix docs/awesome-opencode
-npm run generate --prefix docs/awesome-opencode
-npm run export --prefix docs/awesome-opencode
-bash security/audit-node.sh
+python -m pytest \
+  --cov=backend/agentman/src/agentman \
+  --cov-report=term-missing \
+  --cov-fail-under=70 \
+  backend/agentman/tests tests
 
-node --check frontend/open-antigravity/mitmserver/server.js
-bash -n infra/codex-develop/*.sh
-
-python -m pytest backend/agentman/tests tests
+python -m agentman validate --build-check system/tri-engine
 python -m build backend/agentman
 
+bash security/audit-python.sh
 bash security/scan-secrets.sh

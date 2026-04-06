@@ -36,27 +36,6 @@ class BaseFramework(ABC):
         """Get framework-specific Dockerfile configuration lines."""
         pass
 
-    def get_custom_model_providers(self) -> set:
-        """Extract custom model providers from all models used."""
-        providers = set()
-
-        # Check default model
-        if self.config.default_model and "/" in self.config.default_model:
-            provider = self.config.default_model.split("/")[0]
-            # Skip official providers that don't need custom base URLs
-            if provider.lower() not in ["openai", "anthropic"]:
-                providers.add(provider)
-
-        # Check agent models
-        for agent in self.config.agents.values():
-            if agent.model and "/" in agent.model:
-                provider = agent.model.split("/")[0]
-                # Skip official providers that don't need custom base URLs
-                if provider.lower() not in ["openai", "anthropic"]:
-                    providers.add(provider)
-
-        return providers
-
     def _ensure_output_dir(self):
         """Ensure output directory exists."""
         self.output_dir.mkdir(parents=True, exist_ok=True)

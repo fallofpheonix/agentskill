@@ -1,45 +1,36 @@
-FROM yeahdongcn/agentman-base:latest
+FROM python:3.11-slim
 FRAMEWORK fast-agent
 MODEL anthropic/claude-3-sonnet-20241022
 
 SECRET ANTHROPIC_API_KEY
 
-RUN mkdir -p /workspace /artifacts
 WORKDIR /workspace
 
 AGENT antigravity
-INSTRUCTION Enforce repository analysis first, preserve valid components, expose conflicts, reject blind scaffolding, and require deterministic stage transitions with explicit artifacts and validation.
-SERVERS filesystem commands fetch
+INSTRUCTION Classify repository state, enforce stage ordering, and reject undocumented scope changes.
+SERVERS filesystem commands
 USE_HISTORY true
 HUMAN_INPUT false
 
 AGENT codex
-INSTRUCTION Refactor and integrate existing code only. Move or delete when required, fix dependencies and imports, harden configs, and avoid duplicate implementations.
+INSTRUCTION Apply code and configuration changes only after required input artifacts exist.
 SERVERS filesystem commands
 USE_HISTORY true
 HUMAN_INPUT false
 
 AGENT opencode
-INSTRUCTION Validate execution, CI/CD gates, security scans, deployment steps, and final repo state. Do not allow untested or unsecured changes to advance.
-SERVERS filesystem commands fetch
+INSTRUCTION Run validation gates, security checks, and reject unverifiable output.
+SERVERS filesystem commands
 USE_HISTORY true
 HUMAN_INPUT false
 
 ORCHESTRATOR tri_engine_cicd
 AGENTS antigravity codex opencode
 PLAN_TYPE full
-PLAN_ITERATIONS 14
+PLAN_ITERATIONS 8
+STAGE_SCHEMA stages.yaml
 DEFAULT 1
-INSTRUCTION Analyze and modify the existing monorepo only. Start with repository analysis. Do not scaffold blindly. Reuse, refactor, move, or delete existing code. Preserve working components unless they violate security or determinism constraints. \
-            Phase 0: classify docs/awesome-opencode, backend/agentman, frontend/open-antigravity, infra/codex-develop into KEEP, MODIFY, REPLACE, or DELETE and produce a repo map, dependency graph, conflict list, and refactor plan. \
-            Phase 1: reconcile the repository into /frontend /backend /system /infra /security /ci_cd /tests and emit an old-to-new migration map. \
-            Phase 2: fix broken imports, missing dependencies, dead code, shell/runtime breakpoints, and inline credential handling without regressing working behavior. \
-            Phase 3: align this Agentfile, prompt, repo layout, and stage contracts so orchestration matches the actual system. \
-            Phase 4: retrofit CI/CD for the existing modules by building docs/awesome-opencode, testing backend/agentman, syntax-checking frontend/open-antigravity/mitmserver and infra/codex-develop, auditing Node dependencies, scanning for secrets, and deploying generated registry artifacts automatically. \
-            Phase 5: reject hardcoded secrets, misleading runbooks, unaudited proxies, or undocumented exceptions. \
-            Phase 6: validate builds, tests, and pipeline triggers; fix failures instead of bypassing them. \
-            Phase 7: perform controlled cleanup only after dependency verification. \
-            End only with modified files list, migration map, remaining risks, and modification hooks.
+INSTRUCTION Execute only the stages declared in stages.yaml. Reject missing inputs, duplicate outputs, or undeclared stage transitions.
 
 SERVER filesystem
 COMMAND npx
@@ -49,11 +40,6 @@ TRANSPORT stdio
 SERVER commands
 COMMAND npx
 ARGS -y mcp-server-commands
-TRANSPORT stdio
-
-SERVER fetch
-COMMAND uvx
-ARGS mcp-server-fetch
 TRANSPORT stdio
 
 CMD ["python", "agent.py"]

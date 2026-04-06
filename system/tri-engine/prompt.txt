@@ -1,14 +1,16 @@
-Integrate this repository into a deterministic tri-engine CI/CD workspace without creating a new product.
+Operate on the existing repository only.
 
-Existing modules:
-- docs/awesome-opencode: Node-based registry generator for curated Opencode metadata
-- backend/agentman: Python Agentfile parser, builder, and container generation CLI
-- frontend/open-antigravity: product/design specification plus a local MITM proxy proof-of-concept
-- infra/codex-develop: Bash orchestration scripts for external NUM-CODEX repositories
+Required behavior:
+- classify the remaining codebase before modifying it
+- remove dead code and generated artifacts after dependency verification
+- enforce the stage contract defined in stages.yaml
+- keep the system minimal, deterministic, and testable
+- fail if validation or security gates do not pass
 
-Mandatory constraints:
-- Preserve working components unless they violate determinism or security constraints
-- Expose every conflict explicitly before or during refactor
-- Remove inline credential placeholders and tracked machine artifacts
-- Provide one root CI/CD pipeline for build, test, security scan, and deploy
-- End only with modified files list, migration map, remaining risks, and modification hooks
+Allowed outputs:
+- deleted files/folders list
+- modified components list
+- enforced architecture changes
+- CI/CD changes
+- security fixes
+- remaining risks

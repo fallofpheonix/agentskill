@@ -1,0 +1,58 @@
+version: 1
+stages:
+  - name: analyze_repository
+    agent: antigravity
+    description: Inventory the tracked codebase and classify every remaining component.
+    inputs:
+      - external:repository
+    outputs:
+      - repo_inventory
+      - conflict_report
+      - deletion_plan
+    checks:
+      - classification_complete
+      - dependency_paths_resolved
+
+  - name: repair_core
+    agent: codex
+    description: Apply structural code and configuration changes against the validated inventory.
+    depends_on:
+      - analyze_repository
+    inputs:
+      - repo_inventory
+      - conflict_report
+      - deletion_plan
+    outputs:
+      - patched_codebase
+      - enforced_contract
+    checks:
+      - no_dead_paths
+      - imports_resolved
+      - runtime_surface_minimized
+
+  - name: validate_system
+    agent: opencode
+    description: Execute tests, build checks, and security gates against the patched tree.
+    depends_on:
+      - repair_core
+    inputs:
+      - patched_codebase
+      - enforced_contract
+    outputs:
+      - validation_report
+    checks:
+      - tests_pass
+      - build_pass
+      - security_pass
+
+  - name: finalize_output
+    agent: antigravity
+    description: Emit the constrained final artifact set only after validation has passed.
+    depends_on:
+      - validate_system
+    inputs:
+      - validation_report
+    outputs:
+      - change_record
+    checks:
+      - output_format_enforced

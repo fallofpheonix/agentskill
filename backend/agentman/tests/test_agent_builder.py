@@ -10,20 +10,17 @@ Tests cover all aspects of the AgentBuilder including:
 - Integration with AgentfileConfig
 """
 
-import pytest
 import tempfile
-import os
-import yaml
 from pathlib import Path
-from unittest.mock import patch, mock_open
+from unittest.mock import patch
+
+import yaml
 
 from agentman.agent_builder import AgentBuilder, build_from_agentfile
 from agentman.agentfile_parser import (
     AgentfileConfig,
     MCPServer,
     Agent,
-    Router,
-    Chain,
     Orchestrator,
     SecretValue,
     SecretContext
@@ -36,7 +33,7 @@ class TestAgentBuilder:
     def setup_method(self):
         """Set up test fixtures."""
         self.config = AgentfileConfig()
-        self.config.base_image = "yeahdongcn/agentman-base:latest"
+        self.config.base_image = "python:3.11-slim"
         self.config.default_model = "generic.qwen3:latest"
         self.config.cmd = ["python", "agent.py"]
 
@@ -105,34 +102,6 @@ class TestAgentBuilder:
         # Should contain agent decorator
         assert "@fast.agent" in content
         assert "test_agent" in content
-
-    def test_build_python_content_with_chains(self):
-        """Test Python content generation with chains."""
-        # Add a chain to the config
-        chain = Chain("test_chain")
-        chain.sequence = ["agent1", "agent2"]
-        self.config.chains["test_chain"] = chain
-
-        builder = AgentBuilder(self.config)
-        content = builder.framework.build_agent_content()
-
-        # Should contain chain decorator
-        assert "@fast.chain" in content
-        assert "test_chain" in content
-
-    def test_build_python_content_with_routers(self):
-        """Test Python content generation with routers."""
-        # Add a router to the config
-        router = Router("test_router")
-        router.agents = ["agent1", "agent2"]
-        self.config.routers["test_router"] = router
-
-        builder = AgentBuilder(self.config)
-        content = builder.framework.build_agent_content()
-
-        # Should contain router decorator
-        assert "@fast.router" in content
-        assert "test_router" in content
 
     def test_build_python_content_with_orchestrators(self):
         """Test Python content generation with orchestrators."""
@@ -254,7 +223,7 @@ class TestAgentBuilder:
             with open(dockerfile, 'r') as f:
                 content = f.read()
 
-            assert "FROM yeahdongcn/agentman-base:latest" in content
+            assert "FROM python:3.11-slim" in content
             assert "WORKDIR /app" in content
             assert 'CMD ["python", "agent.py"]' in content
 
@@ -274,8 +243,8 @@ class TestAgentBuilder:
             assert "EXPOSE 8080" in content
 
     def test_generate_dockerfile_fast_agent_base(self):
-        """Test Dockerfile generation with yeahdongcn/agentman-base:latest base."""
-        self.config.base_image = "yeahdongcn/agentman-base:latest"
+        """Test Dockerfile generation with an explicit base image."""
+        self.config.base_image = "python:3.12-slim"
 
         with tempfile.TemporaryDirectory() as temp_dir:
             builder = AgentBuilder(self.config, temp_dir)
@@ -285,7 +254,7 @@ class TestAgentBuilder:
             with open(dockerfile, 'r') as f:
                 content = f.read()
 
-            assert "FROM yeahdongcn/agentman-base:latest" in content
+            assert "FROM python:3.12-slim" in content
             assert "COPY agent.py" in content
             assert "RUN pip install" in content
 
@@ -320,7 +289,6 @@ class TestAgentBuilder:
             with open(req_file, 'r') as f:
                 content = f.read()
 
-            # FIXME: Adjust these assertions based on actual server requirements
             assert "requests" not in content
             assert "psycopg2-binary" not in content
 
@@ -367,6 +335,7 @@ class TestAgentBuilder:
                 "agent.py",
                 "fastagent.config.yaml",
                 "fastagent.secrets.yaml",
+                "orchestration.json",
                 "Dockerfile",
                 "requirements.txt",
                 ".dockerignore"
@@ -396,6 +365,7 @@ class TestAgentBuilder:
                 "agent.py",
                 "fastagent.config.yaml",
                 "fastagent.secrets.yaml",
+                "orchestration.json",
                 "Dockerfile",
                 "requirements.txt",
                 ".dockerignore"
@@ -419,7 +389,7 @@ class TestAgentBuilder:
                 mock_build_all.assert_called_once()
 
     def test_complex_configuration(self):
-        """Test builder with complex configuration including all components."""
+        """Test builder with the active configuration surface."""
         # Set up complex configuration
         self.config.default_model = "anthropic/claude-3-sonnet"
         self.config.expose_ports = [8000, 9000]
@@ -437,11 +407,6 @@ class TestAgentBuilder:
         agent.servers = ["test_server"]
         self.config.agents["test_agent"] = agent
 
-        # Add chain
-        chain = Chain("test_chain")
-        chain.sequence = ["test_agent", "other_agent"]
-        self.config.chains["test_chain"] = chain
-
         # Add secrets
         self.config.secrets = ["OPENAI_API_KEY", SecretValue("CUSTOM_KEY", "value")]
 
@@ -454,7 +419,6 @@ class TestAgentBuilder:
             with open(agent_file, 'r') as f:
                 agent_content = f.read()
             assert "test_agent" in agent_content
-            assert "test_chain" in agent_content
 
             config_file = Path(temp_dir) / "fastagent.config.yaml"
             with open(config_file, 'r') as f:
@@ -486,6 +450,7 @@ class TestAgentBuilderEdgeCases:
                 "agent.py",
                 "fastagent.config.yaml",
                 "fastagent.secrets.yaml",
+                "orchestration.json",
                 "Dockerfile",
                 "requirements.txt",
                 ".dockerignore"
@@ -518,7 +483,7 @@ class TestAgentBuilderEdgeCases:
 
         # Create server with env variables
         server = MCPServer("test_server")
-        server.env = ["TEST_VAR1", "TEST_VAR2"]
+        server.env = {"TEST_VAR1": "placeholder", "TEST_VAR2": "placeholder"}
         config.servers["test_server"] = server
         config.secrets = ["TEST_VAR1"]
 
@@ -530,7 +495,3 @@ class TestAgentBuilderEdgeCases:
 
             secrets_file = Path(temp_dir) / "fastagent.secrets.yaml"
             assert secrets_file.exists()
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])

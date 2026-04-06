@@ -1,13 +1,11 @@
 """Agent builder module for generating files from Agentfile configuration."""
 
 import json
-import subprocess
+import shutil
 from pathlib import Path
 
-import yaml
-
 from agentman.agentfile_parser import AgentfileConfig, AgentfileParser
-from agentman.frameworks import AgnoFramework, FastAgentFramework
+from agentman.frameworks import FastAgentFramework
 
 
 class AgentBuilder:
@@ -38,17 +36,16 @@ class AgentBuilder:
 
     def _get_framework_handler(self):
         """Get the appropriate framework handler based on configuration."""
-        if self.config.framework == "agno":
-            return AgnoFramework(self.config, self._output_dir, self.source_dir)
-        else:
-            return FastAgentFramework(self.config, self._output_dir, self.source_dir)
+        return FastAgentFramework(self.config, self._output_dir, self.source_dir)
 
     def build_all(self):
         """Build all generated files."""
         self._ensure_output_dir()
         self._copy_prompt_file()
+        self._copy_stage_schemas()
         self._generate_python_agent()
         self._generate_config_yaml()
+        self._generate_orchestration_manifest()
         self._generate_dockerfile()
         self._generate_requirements_txt()
         self._generate_dockerignore()
@@ -56,15 +53,27 @@ class AgentBuilder:
 
     def _ensure_output_dir(self):
         """Ensure output directory exists."""
-        self.output_dir.mkdir(exist_ok=True)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def _copy_prompt_file(self):
         """Copy prompt.txt to output directory if it exists."""
         if self.has_prompt_file:
-            import shutil
-
             dest_path = self.output_dir / "prompt.txt"
             shutil.copy2(self.prompt_file_path, dest_path)
+
+    def _copy_stage_schemas(self):
+        """Copy stage schema files into the output directory."""
+        copied = set()
+        for orchestrator in self.config.orchestrators.values():
+            if not orchestrator.stage_schema:
+                continue
+            source_path = self.source_dir / orchestrator.stage_schema
+            if not source_path.exists():
+                raise ValueError(f"Stage schema file not found during build: {source_path}")
+            if source_path.name in copied:
+                continue
+            shutil.copy2(source_path, self.output_dir / source_path.name)
+            copied.add(source_path.name)
 
     def _generate_python_agent(self):
         """Generate the main Python agent file."""
@@ -77,6 +86,35 @@ class AgentBuilder:
     def _generate_config_yaml(self):
         """Generate the configuration file based on framework."""
         self.framework.generate_config_files()
+
+    def _generate_orchestration_manifest(self):
+        """Generate a deterministic manifest for orchestrators and stage contracts."""
+        orchestrators = []
+        for orchestrator in self.config.orchestrators.values():
+            stage_entries = [stage.to_dict() for stage in orchestrator.stages]
+            orchestrators.append(
+                {
+                    "name": orchestrator.name,
+                    "agents": orchestrator.agents,
+                    "model": orchestrator.model or self.config.default_model,
+                    "plan_type": orchestrator.plan_type,
+                    "plan_iterations": orchestrator.plan_iterations,
+                    "default": orchestrator.default,
+                    "stage_schema": orchestrator.stage_schema,
+                    "stages": stage_entries,
+                }
+            )
+
+        manifest = {
+            "framework": self.config.framework,
+            "default_model": self.config.default_model,
+            "orchestrators": orchestrators,
+        }
+
+        manifest_file = self.output_dir / "orchestration.json"
+        with open(manifest_file, 'w', encoding='utf-8') as handle:
+            json.dump(manifest, handle, indent=2, sort_keys=True)
+            handle.write("\n")
 
     def _generate_dockerfile(self):
         """Generate the Dockerfile."""
@@ -224,13 +262,19 @@ class AgentBuilder:
 
     def _validate_output(self):
         """Validate that all required files were generated."""
-        # Skip validation in test environments or when fast-agent is not available
-        try:
-            subprocess.run(["fast-agent", "check"], check=True, cwd=self.output_dir, capture_output=True)
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            # If fast-agent is not available or validation fails, just warn but don't fail
-            print(f"⚠️  Validation skipped: {e}")
-            pass
+        required_files = {
+            "agent.py",
+            "fastagent.config.yaml",
+            "fastagent.secrets.yaml",
+            "Dockerfile",
+            "requirements.txt",
+            ".dockerignore",
+            "orchestration.json",
+        }
+
+        missing = sorted(name for name in required_files if not (self.output_dir / name).exists())
+        if missing:
+            raise ValueError(f"Build output missing required files: {', '.join(missing)}")
 
 
 def build_from_agentfile(agentfile_path: str, output_dir: str = "output") -> None:
@@ -246,14 +290,9 @@ def build_from_agentfile(agentfile_path: str, output_dir: str = "output") -> Non
 
     print(f"✅ Generated agent files in {output_dir}/")
     print("   - agent.py")
-
-    # Show framework-specific config files
-    if config.framework == "agno":
-        print("   - .env")
-    else:
-        print("   - fastagent.config.yaml")
-        print("   - fastagent.secrets.yaml")
-
+    print("   - fastagent.config.yaml")
+    print("   - fastagent.secrets.yaml")
+    print("   - orchestration.json")
     print("   - Dockerfile")
     print("   - requirements.txt")
     print("   - .dockerignore")
@@ -261,3 +300,13 @@ def build_from_agentfile(agentfile_path: str, output_dir: str = "output") -> Non
     # Check if prompt.txt was copied
     if builder.has_prompt_file:
         print("   - prompt.txt")
+
+    copied_schemas = sorted(
+        {
+            Path(orchestrator.stage_schema).name
+            for orchestrator in config.orchestrators.values()
+            if orchestrator.stage_schema
+        }
+    )
+    for schema_name in copied_schemas:
+        print(f"   - {schema_name}")

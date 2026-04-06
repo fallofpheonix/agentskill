@@ -1,1 +1,0 @@
-Clone https://github.com/ollama/ollama and checkout the latest release tag.

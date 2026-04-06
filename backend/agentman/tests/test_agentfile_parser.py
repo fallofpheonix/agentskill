@@ -6,7 +6,7 @@ Tests cover all aspects of the AgentfileParser including:
 - All instruction types (FROM, MODEL, SECRET, EXPOSE, etc.)
 - Server definitions
 - Agent definitions
-- Workflow definitions (ROUTER, CHAIN, ORCHESTRATOR)
+- Orchestrator definitions
 - Secret handling (simple, inline values, contexts)
 - Error handling and validation
 """
@@ -14,14 +14,13 @@ Tests cover all aspects of the AgentfileParser including:
 import pytest
 import tempfile
 import os
+from pathlib import Path
 
 from agentman.agentfile_parser import (
     AgentfileParser,
     AgentfileConfig,
     MCPServer,
     Agent,
-    Router,
-    Chain,
     Orchestrator,
     SecretValue,
     SecretContext
@@ -39,7 +38,7 @@ class TestAgentfileParser:
         """Test parser initialization."""
         assert self.parser.config is not None
         assert isinstance(self.parser.config, AgentfileConfig)
-        assert self.parser.config.base_image == "yeahdongcn/agentman-base:latest"
+        assert self.parser.config.base_image == "python:3.11-slim"
         assert self.parser.config.secrets == []
         assert self.parser.config.servers == {}
         assert self.parser.config.agents == {}
@@ -118,10 +117,139 @@ EXPOSE 8080
     def test_empty_agentfile(self):
         """Test parsing empty Agentfile."""
         config = self.parser.parse_content("")
-        assert config.base_image == "yeahdongcn/agentman-base:latest"
+        assert config.base_image == "python:3.11-slim"
         assert len(config.secrets) == 0
         assert len(config.servers) == 0
         assert len(config.agents) == 0
+
+    def test_parse_file_with_stage_schema(self):
+        """Test parsing an Agentfile with an external stage schema."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            stage_schema = temp_path / "stages.yaml"
+            stage_schema.write_text(
+                """
+version: 1
+stages:
+  - name: analyze
+    agent: antigravity
+    inputs: [external:repository]
+    outputs: [repo_inventory]
+    checks: [classification_complete]
+  - name: validate
+    agent: opencode
+    depends_on: [analyze]
+    inputs: [repo_inventory]
+    outputs: [validation_report]
+    checks: [tests_pass]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            agentfile = temp_path / "Agentfile"
+            agentfile.write_text(
+                """
+FRAMEWORK fast-agent
+AGENT antigravity
+INSTRUCTION Analyze
+AGENT opencode
+INSTRUCTION Validate
+ORCHESTRATOR tri_engine
+AGENTS antigravity opencode
+STAGE_SCHEMA stages.yaml
+DEFAULT 1
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            config = self.parser.parse_file(str(agentfile))
+
+        orchestrator = config.orchestrators["tri_engine"]
+        assert orchestrator.stage_schema == "stages.yaml"
+        assert [stage.name for stage in orchestrator.stages] == ["analyze", "validate"]
+        assert orchestrator.stages[1].depends_on == ["analyze"]
+
+    def test_removed_workflow_instructions_are_rejected(self):
+        """ROUTER and CHAIN are not part of the minimal supported surface."""
+        with pytest.raises(ValueError, match="ROUTER is not supported"):
+            self.parser.parse_content(
+                """
+AGENT antigravity
+INSTRUCTION Analyze
+ROUTER route_work
+AGENTS antigravity
+"""
+            )
+
+        with pytest.raises(ValueError, match="CHAIN is not supported"):
+            self.parser.parse_content(
+                """
+AGENT antigravity
+INSTRUCTION Analyze
+CHAIN chain_work
+SEQUENCE antigravity
+"""
+            )
+
+    def test_stage_schema_rejects_unlinked_artifacts(self):
+        """Test stage schema validation rejects artifact use without dependency linkage."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            (temp_path / "stages.yaml").write_text(
+                """
+version: 1
+stages:
+  - name: analyze
+    agent: antigravity
+    inputs: [external:repository]
+    outputs: [repo_inventory]
+    checks: [classification_complete]
+  - name: validate
+    agent: opencode
+    inputs: [repo_inventory]
+    outputs: [validation_report]
+    checks: [tests_pass]
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            agentfile = temp_path / "Agentfile"
+            agentfile.write_text(
+                """
+AGENT antigravity
+INSTRUCTION Analyze
+AGENT opencode
+INSTRUCTION Validate
+ORCHESTRATOR tri_engine
+AGENTS antigravity opencode
+STAGE_SCHEMA stages.yaml
+DEFAULT 1
+""".strip()
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with pytest.raises(ValueError, match="without depending on it"):
+                self.parser.parse_file(str(agentfile))
+
+    def test_model_subinstruction_within_orchestrator(self):
+        """MODEL inside ORCHESTRATOR context should not overwrite the global model."""
+        config = self.parser.parse_content(
+            """
+MODEL anthropic/claude-3-haiku-20240307
+AGENT antigravity
+INSTRUCTION Analyze
+ORCHESTRATOR tri_engine
+AGENTS antigravity
+MODEL anthropic/claude-3-sonnet-20241022
+"""
+        )
+
+        assert config.default_model == "anthropic/claude-3-haiku-20240307"
+        assert config.orchestrators["tri_engine"].model == "anthropic/claude-3-sonnet-20241022"
 
     def test_comments_and_whitespace(self):
         """Test parsing with comments and extra whitespace."""
@@ -428,10 +556,31 @@ TRANSPORT stdio
         assert server.env["API_URL"] == "https://api.example.com"  # KEY=VALUE format
         assert server.env["DEBUG"] == "true"  # KEY VALUE format
 
+    def test_invalid_sub_instruction_is_rejected(self):
+        """Unknown sub-instructions must fail instead of being ignored."""
+        with pytest.raises(ValueError, match="Unsupported AGENT sub-instruction"):
+            self.parser.parse_content(
+                """
+AGENT antigravity
+INSTRUCTION Analyze
+SEQUENCE antigravity
+"""
+            )
+
     def test_multiline_instruction_syntax(self):
         """Test parsing multiline INSTRUCTION with backslash continuation."""
         content = """
 FROM yeahdongcn/agentman-base:latest
+
+SERVER fetch
+COMMAND uvx
+ARGS mcp-server-fetch
+TRANSPORT stdio
+
+SERVER github-mcp-server
+COMMAND /server/github-mcp-server
+ARGS stdio
+TRANSPORT stdio
 
 AGENT github-release-checker
 INSTRUCTION Given a GitHub repository URL, find the latest **official release** of the repository. \\
@@ -459,6 +608,16 @@ SERVERS fetch github-mcp-server
         """Test parsing complex multiline INSTRUCTION with multiple continuation lines."""
         content = """
 FROM yeahdongcn/agentman-base:latest
+
+SERVER server1
+COMMAND /server/server1
+ARGS stdio
+TRANSPORT stdio
+
+SERVER server2
+COMMAND /server/server2
+ARGS stdio
+TRANSPORT stdio
 
 AGENT complex-agent
 INSTRUCTION This is a very long instruction that spans multiple lines \\
@@ -539,32 +698,6 @@ class TestDataClasses:
         assert secret.name == "GENERIC"
         assert secret.values == {"API_KEY": "value", "BASE_URL": "url"}
 
-    def test_router_creation(self):
-        """Test Router data class creation."""
-        router = Router(
-            name="multi_agent",
-            agents=["agent1", "agent2"],
-            model="anthropic/claude-3-sonnet-20241022",
-            instruction="Route requests"
-        )
-        assert router.name == "multi_agent"
-        assert router.agents == ["agent1", "agent2"]
-        assert router.model == "anthropic/claude-3-sonnet-20241022"
-        assert router.instruction == "Route requests"
-        assert router.default is False
-
-    def test_chain_creation(self):
-        """Test Chain data class creation."""
-        chain = Chain(
-            name="sequential",
-            sequence=["agent1", "agent2"],
-            instruction="Process sequentially"
-        )
-        assert chain.name == "sequential"
-        assert chain.sequence == ["agent1", "agent2"]
-        assert chain.instruction == "Process sequentially"
-        assert chain.default is False
-
     def test_orchestrator_creation(self):
         """Test Orchestrator data class creation."""
         orchestrator = Orchestrator(
@@ -598,7 +731,3 @@ class TestDataClasses:
         assert config.cmd == ["python", "app.py"]
         assert config.servers == {}
         assert config.agents == {}
-
-
-if __name__ == "__main__":
-    pytest.main([__file__])

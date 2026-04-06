@@ -1,8 +1,6 @@
-#!/usr/bin/env python3
 """Test script to verify prompt.txt support in AgentBuilder."""
 
 import tempfile
-import os
 from pathlib import Path
 
 from agentman.agentfile_parser import AgentfileParser
@@ -70,7 +68,6 @@ INSTRUCTION You are a helpful test agent.
 
             assert "COPY prompt.txt ." in dockerfile_content, "Dockerfile should copy prompt.txt"
 
-            print("✅ prompt.txt support test passed!")
 
 
 def test_no_prompt_txt_backward_compatibility():
@@ -122,11 +119,3 @@ INSTRUCTION You are a helpful test agent.
                 dockerfile_content = f.read()
 
             assert "COPY prompt.txt ." not in dockerfile_content, "Dockerfile should not copy prompt.txt"
-
-            print("✅ backward compatibility test passed!")
-
-
-if __name__ == "__main__":
-    test_prompt_txt_support()
-    test_no_prompt_txt_backward_compatibility()
-    print("🎉 All tests passed!")

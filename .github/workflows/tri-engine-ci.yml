@@ -1,4 +1,4 @@
-name: Tri-Engine CI/CD
+name: Tri-Engine Validation
 
 on:
   pull_request:
@@ -10,123 +10,16 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  validate:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install backend build dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e 'backend/agentman[dev]' build
-
-      - name: Install Node dependencies
-        run: |
-          npm ci --prefix docs/awesome-opencode
-          npm ci --prefix frontend/open-antigravity/mitmserver
-
-      - name: Build curated registry artifacts
-        run: |
-          npm run generate --prefix docs/awesome-opencode
-          npm run export --prefix docs/awesome-opencode
-
-      - name: Build agentman package
-        run: python -m build backend/agentman
-
-      - name: Upload agentman artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: agentman-dist
-          path: backend/agentman/dist
-
-  test:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e 'backend/agentman[dev]'
-          npm ci --prefix docs/awesome-opencode
-
-      - name: Run tests and syntax checks
-        run: |
-          python -m pytest backend/agentman/tests tests
-          npm run validate --prefix docs/awesome-opencode
-          node --check frontend/open-antigravity/mitmserver/server.js
-          bash -n infra/codex-develop/*.sh
-
-  security:
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Install Node dependencies
-        run: |
-          npm ci --prefix docs/awesome-opencode
-          npm ci --prefix frontend/open-antigravity/mitmserver
-
-      - name: Run dependency and secret scans
-        run: |
-          bash security/audit-node.sh
-          bash security/scan-secrets.sh
-
-  deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && github.actor != 'github-actions[bot]'
-    runs-on: ubuntu-latest
-    needs: security
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: true
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Regenerate published registry artifacts
-        run: |
-          npm ci --prefix docs/awesome-opencode
-          npm run generate --prefix docs/awesome-opencode
-          npm run export --prefix docs/awesome-opencode
-
-      - name: Commit generated artifacts
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "ci: auto-regenerate registry docs"
-          file_pattern: "docs/awesome-opencode/README.md docs/awesome-opencode/dist/registry.json"
+      - name: Run repository validation
+        run: bash ci_cd/validate_workspace.sh

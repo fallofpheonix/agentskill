@@ -1,8 +1,11 @@
 """Agentfile parser module for parsing Agentfile configurations."""
 
 import json
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Union
+
+import yaml
 
 
 @dataclass
@@ -68,70 +71,6 @@ class Agent:
 
 
 @dataclass
-class Router:
-    """Represents a router workflow."""
-
-    name: str
-    agents: List[str] = field(default_factory=list)
-    model: Optional[str] = None
-    instruction: Optional[str] = None
-    default: bool = False
-
-    def to_decorator_string(self, default_model: Optional[str] = None) -> str:
-        """Generate the @fast.router decorator string."""
-        params = [f'name="{self.name}"']
-
-        if self.agents:
-            agents_str = "[" + ", ".join(f'"{a}"' for a in self.agents) + "]"
-            params.append(f"agents={agents_str}")
-
-        if model_to_use := (self.model or default_model):
-            params.append(f'model="{model_to_use}"')
-
-        if self.instruction:
-            params.append(f'instruction="""{self.instruction}"""')
-
-        if self.default:
-            params.append("default=True")
-
-        return "@fast.router(\n    " + ",\n    ".join(params) + "\n)"
-
-
-@dataclass
-class Chain:
-    """Represents a chain workflow."""
-
-    name: str
-    sequence: List[str] = field(default_factory=list)
-    instruction: Optional[str] = None
-    cumulative: bool = False
-    continue_with_final: bool = True
-    default: bool = False
-
-    def to_decorator_string(self) -> str:
-        """Generate the @fast.chain decorator string."""
-        params = [f'name="{self.name}"']
-
-        if self.sequence:
-            sequence_str = "[" + ", ".join(f'"{a}"' for a in self.sequence) + "]"
-            params.append(f"sequence={sequence_str}")
-
-        if self.instruction:
-            params.append(f'instruction="""{self.instruction}"""')
-
-        if self.cumulative:
-            params.append("cumulative=True")
-
-        if not self.continue_with_final:
-            params.append("continue_with_final=False")
-
-        if self.default:
-            params.append("default=True")
-
-        return "@fast.chain(\n    " + ",\n    ".join(params) + "\n)"
-
-
-@dataclass
 class Orchestrator:
     """Represents an orchestrator workflow."""
 
@@ -143,6 +82,8 @@ class Orchestrator:
     plan_iterations: int = 5
     human_input: bool = False
     default: bool = False
+    stage_schema: Optional[str] = None
+    stages: List["StageDefinition"] = field(default_factory=list)
 
     def to_decorator_string(self, default_model: Optional[str] = None) -> str:
         """Generate the @fast.orchestrator decorator string."""
@@ -212,21 +153,37 @@ class DockerfileInstruction:
 
 
 @dataclass
+class StageDefinition:
+    """Represents an executable orchestrator stage."""
+
+    name: str
+    agent: str
+    inputs: List[str] = field(default_factory=list)
+    outputs: List[str] = field(default_factory=list)
+    checks: List[str] = field(default_factory=list)
+    depends_on: List[str] = field(default_factory=list)
+    description: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert stage definition to a serializable dictionary."""
+        return asdict(self)
+
+
+@dataclass
 class AgentfileConfig:
     """Represents the complete Agentfile configuration."""
 
-    base_image: str = "yeahdongcn/agentman-base:latest"
+    base_image: str = "python:3.11-slim"
     default_model: Optional[str] = None
-    framework: str = "fast-agent"  # "fast-agent" or "agno"
+    framework: str = "fast-agent"
     servers: Dict[str, MCPServer] = field(default_factory=dict)
     agents: Dict[str, Agent] = field(default_factory=dict)
-    routers: Dict[str, Router] = field(default_factory=dict)
-    chains: Dict[str, Chain] = field(default_factory=dict)
     orchestrators: Dict[str, Orchestrator] = field(default_factory=dict)
     secrets: List[SecretType] = field(default_factory=list)
     expose_ports: List[int] = field(default_factory=list)
     cmd: List[str] = field(default_factory=lambda: ["python", "agent.py"])
     dockerfile_instructions: List[DockerfileInstruction] = field(default_factory=list)
+    source_path: Optional[str] = None
 
 
 class AgentfileParser:
@@ -239,12 +196,23 @@ class AgentfileParser:
 
     def parse_file(self, filepath: str) -> AgentfileConfig:
         """Parse an Agentfile and return the configuration."""
-        with open(filepath, 'r', encoding='utf-8') as f:
+        path = Path(filepath).resolve()
+        with open(path, 'r', encoding='utf-8') as f:
             content = f.read()
-        return self.parse_content(content)
+        return self.parse_content(content, base_dir=path.parent, source_path=str(path))
 
-    def parse_content(self, content: str) -> AgentfileConfig:
+    def parse_content(
+        self,
+        content: str,
+        base_dir: Optional[Path] = None,
+        source_path: Optional[str] = None,
+    ) -> AgentfileConfig:
         """Parse Agentfile content and return the configuration."""
+        self.config = AgentfileConfig()
+        self.current_context = None
+        self.current_item = None
+        self.config.source_path = source_path
+
         lines = content.split('\n')
 
         # Pre-process lines to handle multi-line continuations with backslash
@@ -293,6 +261,7 @@ class AgentfileParser:
             except Exception as e:
                 raise ValueError(f"Error parsing line {line_num}: {line}\n{str(e)}") from e
 
+        self._validate_config(base_dir)
         return self.config
 
     def _parse_line(self, line: str):
@@ -307,7 +276,7 @@ class AgentfileParser:
         # Agentman-specific instructions (not Docker)
         if instruction == "MODEL":
             # Check if we're in a context that should handle MODEL as sub-instruction
-            if self.current_context in ["agent"]:
+            if self.current_context in ["agent", "orchestrator"]:
                 self._handle_sub_instruction(instruction, parts)
             else:
                 self._handle_model(parts)
@@ -318,9 +287,9 @@ class AgentfileParser:
         elif instruction == "AGENT":
             self._handle_agent(parts)
         elif instruction == "ROUTER":
-            self._handle_router(parts)
+            raise ValueError("ROUTER is not supported in the minimal tri-engine runtime")
         elif instruction == "CHAIN":
-            self._handle_chain(parts)
+            raise ValueError("CHAIN is not supported in the minimal tri-engine runtime")
         elif instruction == "ORCHESTRATOR":
             self._handle_orchestrator(parts)
         elif instruction == "SECRET":
@@ -367,14 +336,13 @@ class AgentfileParser:
             "INSTRUCTION",
             "SERVERS",
             "AGENTS",
-            "SEQUENCE",
+            "STAGE_SCHEMA",
             "TRANSPORT",
             "URL",
             "USE_HISTORY",
             "HUMAN_INPUT",
             "PLAN_TYPE",
             "PLAN_ITERATIONS",
-            "CUMULATIVE",
             "API_KEY",
             "BASE_URL",
             "DEFAULT",
@@ -389,9 +357,14 @@ class AgentfileParser:
                 # It's a Dockerfile instruction
                 self._handle_dockerfile_instruction(instruction, parts)
         else:
-            # Unknown instruction - treat as potential Dockerfile instruction
-            # for forward compatibility
-            self._handle_dockerfile_instruction(instruction, parts)
+            if self.current_context == "secret":
+                self._handle_secret_sub_instruction(instruction, parts)
+            elif self.current_context:
+                raise ValueError(f"Unsupported {self.current_context.upper()} sub-instruction: {instruction}")
+            else:
+                # Unknown top-level instructions are preserved as Dockerfile lines
+                # for forward compatibility with the container surface.
+                self._handle_dockerfile_instruction(instruction, parts)
 
     def _split_respecting_quotes(self, line: str) -> List[str]:
         """Split line by whitespace but respect quoted strings."""
@@ -450,8 +423,8 @@ class AgentfileParser:
         if len(parts) < 2:
             raise ValueError("FRAMEWORK requires a framework name")
         framework = self._unquote(parts[1]).lower()
-        if framework not in ["fast-agent", "agno"]:
-            raise ValueError(f"Unsupported framework: {framework}. Supported: fast-agent, agno")
+        if framework != "fast-agent":
+            raise ValueError(f"Unsupported framework: {framework}. Supported: fast-agent")
         self.config.framework = framework
         self.current_context = None
 
@@ -471,24 +444,6 @@ class AgentfileParser:
         name = self._unquote(parts[1])
         self.config.agents[name] = Agent(name=name)
         self.current_context = "agent"
-        self.current_item = name
-
-    def _handle_router(self, parts: List[str]):
-        """Handle ROUTER instruction."""
-        if len(parts) < 2:
-            raise ValueError("ROUTER requires a router name")
-        name = self._unquote(parts[1])
-        self.config.routers[name] = Router(name=name)
-        self.current_context = "router"
-        self.current_item = name
-
-    def _handle_chain(self, parts: List[str]):
-        """Handle CHAIN instruction."""
-        if len(parts) < 2:
-            raise ValueError("CHAIN requires a chain name")
-        name = self._unquote(parts[1])
-        self.config.chains[name] = Chain(name=name)
-        self.current_context = "chain"
         self.current_item = name
 
     def _handle_orchestrator(self, parts: List[str]):
@@ -637,10 +592,6 @@ class AgentfileParser:
             self._handle_server_sub_instruction(instruction, parts)
         elif self.current_context == "agent":
             self._handle_agent_sub_instruction(instruction, parts)
-        elif self.current_context == "router":
-            self._handle_router_sub_instruction(instruction, parts)
-        elif self.current_context == "chain":
-            self._handle_chain_sub_instruction(instruction, parts)
         elif self.current_context == "orchestrator":
             self._handle_orchestrator_sub_instruction(instruction, parts)
         elif self.current_context == "secret":
@@ -690,6 +641,8 @@ class AgentfileParser:
                 server.env[key] = value
             else:
                 raise ValueError("ENV requires KEY VALUE or KEY=VALUE")
+        else:
+            raise ValueError(f"Unsupported SERVER sub-instruction: {instruction}")
 
     def _handle_agent_sub_instruction(self, instruction: str, parts: List[str]):
         """Handle sub-instructions for AGENT context."""
@@ -719,52 +672,8 @@ class AgentfileParser:
             if len(parts) < 2:
                 raise ValueError("DEFAULT requires true/false")
             agent.default = self._unquote(parts[1]).lower() in ['true', '1', 'yes']
-
-    def _handle_router_sub_instruction(self, instruction: str, parts: List[str]):
-        """Handle sub-instructions for ROUTER context."""
-        router = self.config.routers[self.current_item]
-
-        if instruction == "AGENTS":
-            if len(parts) < 2:
-                raise ValueError("AGENTS requires at least one agent name")
-            router.agents = [self._unquote(part) for part in parts[1:]]
-        elif instruction == "MODEL":
-            if len(parts) < 2:
-                raise ValueError("MODEL requires a model name")
-            router.model = self._unquote(parts[1])
-        elif instruction == "INSTRUCTION":
-            if len(parts) < 2:
-                raise ValueError("INSTRUCTION requires instruction text")
-            router.instruction = self._unquote(' '.join(parts[1:]))
-        elif instruction == "DEFAULT":
-            if len(parts) < 2:
-                raise ValueError("DEFAULT requires true/false")
-            router.default = self._unquote(parts[1]).lower() in ['true', '1', 'yes']
-
-    def _handle_chain_sub_instruction(self, instruction: str, parts: List[str]):
-        """Handle sub-instructions for CHAIN context."""
-        chain = self.config.chains[self.current_item]
-
-        if instruction == "SEQUENCE":
-            if len(parts) < 2:
-                raise ValueError("SEQUENCE requires at least one agent name")
-            chain.sequence = [self._unquote(part) for part in parts[1:]]
-        elif instruction == "INSTRUCTION":
-            if len(parts) < 2:
-                raise ValueError("INSTRUCTION requires instruction text")
-            chain.instruction = self._unquote(' '.join(parts[1:]))
-        elif instruction == "CUMULATIVE":
-            if len(parts) < 2:
-                raise ValueError("CUMULATIVE requires true/false")
-            chain.cumulative = self._unquote(parts[1]).lower() in ['true', '1', 'yes']
-        elif instruction == "CONTINUE_WITH_FINAL":
-            if len(parts) < 2:
-                raise ValueError("CONTINUE_WITH_FINAL requires true/false")
-            chain.continue_with_final = self._unquote(parts[1]).lower() in ['true', '1', 'yes']
-        elif instruction == "DEFAULT":
-            if len(parts) < 2:
-                raise ValueError("DEFAULT requires true/false")
-            chain.default = self._unquote(parts[1]).lower() in ['true', '1', 'yes']
+        else:
+            raise ValueError(f"Unsupported AGENT sub-instruction: {instruction}")
 
     def _handle_orchestrator_sub_instruction(self, instruction: str, parts: List[str]):
         """Handle sub-instructions for ORCHESTRATOR context."""
@@ -804,3 +713,167 @@ class AgentfileParser:
             if len(parts) < 2:
                 raise ValueError("DEFAULT requires true/false")
             orchestrator.default = self._unquote(parts[1]).lower() in ['true', '1', 'yes']
+        elif instruction == "STAGE_SCHEMA":
+            if len(parts) < 2:
+                raise ValueError("STAGE_SCHEMA requires a file path")
+            orchestrator.stage_schema = self._unquote(parts[1])
+        else:
+            raise ValueError(f"Unsupported ORCHESTRATOR sub-instruction: {instruction}")
+
+    def _validate_config(self, base_dir: Optional[Path]) -> None:
+        """Validate cross-reference integrity for the parsed configuration."""
+        self._validate_agent_servers()
+        self._validate_orchestrator_references(base_dir)
+
+    def _validate_agent_servers(self) -> None:
+        """Ensure each referenced server exists."""
+        for agent in self.config.agents.values():
+            missing = [server for server in agent.servers if server not in self.config.servers]
+            if missing:
+                raise ValueError(f"Agent {agent.name} references undefined servers: {', '.join(missing)}")
+
+    def _validate_orchestrator_references(self, base_dir: Optional[Path]) -> None:
+        """Validate orchestrator references and load structured stage schemas."""
+        default_orchestrators = [name for name, item in self.config.orchestrators.items() if item.default]
+        if len(default_orchestrators) > 1:
+            raise ValueError("Only one orchestrator can be marked DEFAULT true")
+
+        for orchestrator in self.config.orchestrators.values():
+            missing_agents = [agent for agent in orchestrator.agents if agent not in self.config.agents]
+            if missing_agents:
+                raise ValueError(
+                    f"Orchestrator {orchestrator.name} references undefined agents: {', '.join(missing_agents)}"
+                )
+            if orchestrator.stage_schema:
+                orchestrator.stages = self._load_stage_schema(orchestrator, base_dir)
+
+    def _load_stage_schema(self, orchestrator: Orchestrator, base_dir: Optional[Path]) -> List[StageDefinition]:
+        """Load and validate an orchestrator stage schema."""
+        if base_dir is None:
+            raise ValueError(f"Orchestrator {orchestrator.name} requires a file-backed parse for STAGE_SCHEMA")
+
+        schema_path = (base_dir / orchestrator.stage_schema).resolve()
+        if not schema_path.exists():
+            raise ValueError(f"Stage schema not found: {schema_path}")
+
+        with open(schema_path, 'r', encoding='utf-8') as handle:
+            raw = yaml.safe_load(handle) or {}
+
+        if not isinstance(raw, dict):
+            raise ValueError(f"Stage schema must be a mapping: {schema_path}")
+
+        raw_stages = raw.get("stages")
+        if not isinstance(raw_stages, list) or not raw_stages:
+            raise ValueError(f"Stage schema {schema_path} must define a non-empty 'stages' list")
+
+        stages: List[StageDefinition] = []
+        seen_stage_names: Set[str] = set()
+        produced_artifacts: Dict[str, str] = {}
+
+        for index, item in enumerate(raw_stages, start=1):
+            stage = self._parse_stage_definition(item, index)
+            if stage.name in seen_stage_names:
+                raise ValueError(f"Duplicate stage name in {schema_path}: {stage.name}")
+            if stage.agent not in orchestrator.agents:
+                raise ValueError(
+                    f"Stage {stage.name} uses agent {stage.agent} outside orchestrator {orchestrator.name}"
+                )
+            if stage.agent not in self.config.agents:
+                raise ValueError(f"Stage {stage.name} references undefined agent {stage.agent}")
+            invalid_dependencies = [name for name in stage.depends_on if name not in seen_stage_names]
+            if invalid_dependencies:
+                raise ValueError(
+                    f"Stage {stage.name} has invalid depends_on entries: {', '.join(invalid_dependencies)}"
+                )
+
+            internal_inputs = [artifact for artifact in stage.inputs if not artifact.startswith("external:")]
+            unresolved_inputs = [artifact for artifact in internal_inputs if artifact not in produced_artifacts]
+            if unresolved_inputs:
+                raise ValueError(
+                    f"Stage {stage.name} requires artifacts not produced earlier: {', '.join(unresolved_inputs)}"
+                )
+
+            dependency_closure = self._resolve_stage_dependencies(stages, stage.depends_on)
+            for artifact in internal_inputs:
+                producer = produced_artifacts[artifact]
+                if producer not in dependency_closure:
+                    raise ValueError(
+                        f"Stage {stage.name} consumes artifact {artifact} from {producer} without depending on it"
+                    )
+
+            for artifact in stage.outputs:
+                if artifact.startswith("external:"):
+                    raise ValueError(f"Stage {stage.name} output cannot use reserved external: prefix")
+                if artifact in produced_artifacts:
+                    raise ValueError(
+                        f"Artifact {artifact} is produced by both {produced_artifacts[artifact]} and {stage.name}"
+                    )
+                produced_artifacts[artifact] = stage.name
+
+            stages.append(stage)
+            seen_stage_names.add(stage.name)
+
+        return stages
+
+    def _parse_stage_definition(self, item: Any, index: int) -> StageDefinition:
+        """Parse and validate a single stage definition."""
+        if not isinstance(item, dict):
+            raise ValueError(f"Stage entry #{index} must be a mapping")
+
+        required_keys = {"name", "agent", "inputs", "outputs", "checks"}
+        missing = sorted(required_keys - set(item))
+        if missing:
+            raise ValueError(f"Stage entry #{index} is missing required keys: {', '.join(missing)}")
+
+        stage = StageDefinition(
+            name=self._require_string(item["name"], f"stage[{index}].name"),
+            agent=self._require_string(item["agent"], f"stage[{index}].agent"),
+            inputs=self._require_string_list(item["inputs"], f"stage[{index}].inputs"),
+            outputs=self._require_string_list(item["outputs"], f"stage[{index}].outputs"),
+            checks=self._require_string_list(item["checks"], f"stage[{index}].checks"),
+            depends_on=self._require_string_list(item.get("depends_on", []), f"stage[{index}].depends_on"),
+            description=(
+                self._require_string(item["description"], f"stage[{index}].description")
+                if "description" in item and item["description"] is not None
+                else None
+            ),
+        )
+
+        if not stage.outputs:
+            raise ValueError(f"Stage {stage.name} must define at least one output artifact")
+        if not stage.checks:
+            raise ValueError(f"Stage {stage.name} must define at least one validation check")
+
+        return stage
+
+    def _resolve_stage_dependencies(self, stages: List[StageDefinition], depends_on: List[str]) -> Set[str]:
+        """Resolve the transitive dependency closure for a stage."""
+        stage_by_name = {stage.name: stage for stage in stages}
+        resolved: Set[str] = set()
+        stack = list(depends_on)
+
+        while stack:
+            stage_name = stack.pop()
+            if stage_name in resolved:
+                continue
+            resolved.add(stage_name)
+            stack.extend(stage_by_name[stage_name].depends_on)
+
+        return resolved
+
+    def _require_string(self, value: Any, field_name: str) -> str:
+        """Validate that a field is a string."""
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} must be a non-empty string")
+        return value.strip()
+
+    def _require_string_list(self, value: Any, field_name: str) -> List[str]:
+        """Validate that a field is a list of non-empty strings."""
+        if not isinstance(value, list):
+            raise ValueError(f"{field_name} must be a list")
+        result: List[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(f"{field_name}[{index}] must be a non-empty string")
+            result.append(item.strip())
+        return result

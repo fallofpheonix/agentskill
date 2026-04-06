@@ -1,8 +1,6 @@
-#!/usr/bin/env python3
 """Test script to verify EXPOSE and CMD instructions are properly handled in Dockerfile generation."""
 
 import tempfile
-import os
 from pathlib import Path
 
 from agentman.agentfile_parser import AgentfileParser
@@ -26,16 +24,6 @@ CMD ["python", "agent.py"]
     parser = AgentfileParser()
     config = parser.parse_content(agentfile_content)
 
-    print("Parsed configuration:")
-    print(f"Base image: {config.base_image}")
-    print(f"Default model: {config.default_model}")
-    print(f"Expose ports: {config.expose_ports}")
-    print(f"CMD: {config.cmd}")
-    print(f"Dockerfile instructions: {len(config.dockerfile_instructions)}")
-
-    for i, instruction in enumerate(config.dockerfile_instructions):
-        print(f"  {i}: {instruction.instruction} {instruction.args}")
-
     # Create a temporary directory for output
     with tempfile.TemporaryDirectory() as temp_dir:
         # Build the agent
@@ -47,17 +35,8 @@ CMD ["python", "agent.py"]
         with open(dockerfile_path, 'r') as f:
             dockerfile_content = f.read()
 
-        print("\nGenerated Dockerfile:")
-        print(dockerfile_content)
-
         # Verify EXPOSE and CMD instructions are present
         assert "EXPOSE 8080" in dockerfile_content, "EXPOSE 8080 not found in Dockerfile"
         assert "EXPOSE 9090" in dockerfile_content, "EXPOSE 9090 not found in Dockerfile"
         assert 'CMD ["python", "agent.py"]' in dockerfile_content, "CMD instruction not found in Dockerfile"
         assert "RUN apt-get update && apt-get install -y wget" in dockerfile_content, "Custom RUN instruction not found"
-
-        print("\n✅ All checks passed! EXPOSE and CMD instructions are properly included.")
-
-
-if __name__ == "__main__":
-    test_dockerfile_generation_with_expose_and_cmd()

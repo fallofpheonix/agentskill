@@ -27,14 +27,6 @@ class FastAgentFramework(BaseFramework):
         for agent in self.config.agents.values():
             lines.append(agent.to_decorator_string(self.config.default_model))
 
-        # Router definitions
-        for router in self.config.routers.values():
-            lines.append(router.to_decorator_string(self.config.default_model))
-
-        # Chain definitions
-        for chain in self.config.chains.values():
-            lines.append(chain.to_decorator_string())
-
         # Orchestrator definitions
         for orchestrator in self.config.orchestrators.values():
             lines.append(orchestrator.to_decorator_string(self.config.default_model))
@@ -76,8 +68,8 @@ class FastAgentFramework(BaseFramework):
     def get_requirements(self) -> List[str]:
         """Get requirements for Fast-Agent framework."""
         requirements = [
-            "fast-agent-mcp>=0.2.33",
-            "deprecated>=1.2.18",
+            "fast-agent-mcp==0.2.33",
+            "deprecated==1.2.18",
         ]
 
         # Add additional requirements based on servers used
